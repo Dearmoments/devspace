@@ -10,9 +10,19 @@ import {
 } from "./card-types.js";
 
 test("the supported coding tools are recognized as card tools", () => {
-  for (const tool of ["apply_patch", "exec_command", "write_stdin"]) {
+  for (const tool of ["list_projects", "apply_patch", "exec_command", "write_stdin"]) {
     assert.equal(isToolName(tool), true, `${tool} should be a recognized card tool`);
   }
+});
+
+test("a project list card opens immediately", () => {
+  assert.equal(
+    isInitiallyExpandedCard({
+      tool: "list_projects",
+      payload: { content: [{ type: "text", text: "project" }] },
+    }),
+    true,
+  );
 });
 
 test("tool classification distinguishes patch, edit, and shell operations", () => {

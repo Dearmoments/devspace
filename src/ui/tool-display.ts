@@ -28,6 +28,13 @@ export type ToolHeaderSummary =
 
 export function getToolDisplay(card: ToolResultCard): ToolDisplay {
   switch (card.tool) {
+    case "list_projects":
+      return {
+        icon: toolIcons.folderTree,
+        title: "Available projects",
+        label: projectCountLabel(card),
+        tone: "workspace",
+      };
     case "open_workspace":
       return {
         icon: card.mode === "worktree" ? toolIcons.gitBranch : toolIcons.folderOpen,
@@ -130,6 +137,13 @@ export function getToolHeaderSummary(card: ToolResultCard): ToolHeaderSummary {
     };
   }
 
+  if (card.tool === "list_projects") {
+    const projects = summaryNumber(summary, "projects");
+    return projects === undefined
+      ? { kind: "empty" }
+      : { kind: "text", text: countLabel(projects, "project") ?? "" };
+  }
+
   if (card.tool === "open_workspace") {
     const parts = [
       countLabel(summaryNumber(summary, "agentsFiles"), "instruction"),
@@ -163,6 +177,11 @@ function patchIcon(kind: ReturnType<typeof getPatchDisplayParts>["iconKind"]): T
 
 function workspaceTitle(card: ToolResultCard): string {
   return `${card.workspaceReused ? "Reused" : "Opened"} workspace`;
+}
+
+function projectCountLabel(card: ToolResultCard): string | undefined {
+  const count = summaryNumber(card.summary, "projects") ?? card.projects?.length;
+  return count === undefined ? undefined : countLabel(count, "project");
 }
 
 function singleFilePath(card: ToolResultCard): string | undefined {

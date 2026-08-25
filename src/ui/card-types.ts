@@ -1,6 +1,7 @@
 import type { App } from "@modelcontextprotocol/ext-apps";
 
 export type ToolName =
+  | "list_projects"
   | "open_workspace"
   | "show_changes"
   | "apply_patch"
@@ -78,6 +79,12 @@ export interface ToolResultCard {
     effort?: string;
   }>;
   instruction?: string;
+  roots?: string[];
+  projects?: Array<{
+    name?: string;
+    path?: string;
+    root?: string;
+  }>;
 }
 
 export interface ToolContent {
@@ -95,6 +102,7 @@ export interface ToolPayload {
 
 export function isToolName(value: unknown): value is ToolName {
   return (
+    value === "list_projects" ||
     value === "open_workspace" ||
     value === "show_changes" ||
     value === "apply_patch" ||
@@ -186,6 +194,7 @@ export function isExpandableCard(card: ToolResultCard): boolean {
 }
 
 export function isInitiallyExpandedCard(card: ToolResultCard): boolean {
+  if (card.tool === "list_projects") return isExpandableCard(card);
   if (card.tool === "open_workspace") return isExpandableCard(card);
   if (isReviewTool(card.tool)) return isExpandableCard(card);
   if (isPatchTool(card.tool)) {

@@ -4,6 +4,7 @@ import { toolIcons } from "./icons.js";
 import { getToolDisplay, getToolHeaderSummary } from "./tool-display.js";
 
 const displayCases: Array<[ToolResultCard, { title: string; tone: string }]> = [
+  [{ tool: "list_projects", summary: { projects: 3 } }, { title: "Available projects", tone: "workspace" }],
   [{ tool: "open_workspace", root: "/tmp/project" }, { title: "Opened workspace", tone: "workspace" }],
   [{ tool: "open_workspace", root: "/tmp/project", workspaceReused: true }, { title: "Reused workspace", tone: "workspace" }],
   [{ tool: "open_workspace", root: "/tmp/project", mode: "worktree" }, { title: "Opened workspace", tone: "workspace" }],
@@ -28,6 +29,7 @@ for (const [card, expected] of displayCases) {
 }
 
 assert.equal(getToolDisplay({ tool: "open_workspace", root: "/tmp/project" }).label, "/tmp/project");
+assert.equal(getToolDisplay({ tool: "list_projects", summary: { projects: 3 } }).label, "3 projects");
 assert.equal(
   getToolDisplay({ tool: "open_workspace", root: "/tmp/project" }).icon,
   toolIcons.folderOpen,

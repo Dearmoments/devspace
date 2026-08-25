@@ -19,6 +19,28 @@ import { WorkspaceRegistry } from "./workspaces.js";
 
 const execFileAsync = promisify(execFile);
 
+test("list_projects discovers allowed roots before a workspace is opened", async (t) => {
+  const context = await fixture(t);
+  const tools = await context.client.listTools();
+  const listTool = tools.tools.find((tool) => tool.name === "list_projects");
+  assert.ok(listTool);
+  assert.equal(
+    (listTool._meta as { ui?: { resourceUri?: string } } | undefined)?.ui?.resourceUri,
+    "ui://devspace/workspace-app.html",
+  );
+
+  const result = await context.client.callTool({ name: "list_projects", arguments: {} });
+  const structured = structuredContent(result);
+  assert.deepEqual(structured.roots, context.config.allowedRoots);
+  assert.ok(
+    (structured.projects as Array<{ name: string; path: string }>).some(
+      (project) => project.name === "project" && project.path === context.project,
+    ),
+  );
+  assert.match(responseText(result), /Immediate project directories:/);
+  assert.equal(responseCard(result).tool, "list_projects");
+});
+
 test("open_workspace keeps lifecycle flags out of model output and preserves complete card metadata", async (t) => {
   const providerNote = "available";
   const context = await fixture(t, {

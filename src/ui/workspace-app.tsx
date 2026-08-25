@@ -241,6 +241,11 @@ async function renderPayloadIfNeeded(): Promise<void> {
     return;
   }
 
+  if (card.tool === "list_projects") {
+    renderProjectsPayload(target, card);
+    return;
+  }
+
   if (shouldUseHeavyPayload(card)) {
     if (currentPayload) {
       currentPayload.update({ card, hostContext, errorMessage });
@@ -303,6 +308,35 @@ async function renderPayloadIfNeeded(): Promise<void> {
   }
 
   renderPrePayload(target, text, card.tool);
+}
+
+function renderProjectsPayload(container: HTMLElement, card: ToolResultCard): void {
+  unmountCurrentPayload();
+
+  const details = element("div", { className: "workspace-details pretty-scrollbar" });
+  const rows = element("div", { className: "workspace-rows" });
+  const projects = card.projects ?? [];
+
+  if (projects.length === 0) {
+    details.append(element("div", { className: "status muted", text: "No project directories found." }));
+  } else {
+    for (const project of projects) {
+      const path = project.path ?? "";
+      const name = project.name ?? path;
+      const value = element("span", {
+        className: "workspace-value",
+        text: path,
+        title: path,
+      });
+      const row = element("div", { className: "workspace-row project-row" });
+      const label = element("span", { className: "workspace-row-label", text: name });
+      row.append(renderIcon(toolIcons.folderOpen, "workspace-row-icon"), label, value);
+      rows.append(row);
+    }
+    details.append(rows);
+  }
+
+  container.replaceChildren(details);
 }
 
 function shouldUseHeavyPayload(card: ToolResultCard): boolean {

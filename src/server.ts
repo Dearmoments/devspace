@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { access, realpath } from "node:fs/promises";
+import { access, readdir, realpath } from "node:fs/promises";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
@@ -168,6 +169,7 @@ function toolWidgetDescriptorMeta(
 }
 
 const toolNames = {
+  listProjects: "list_projects",
   openWorkspace: "open_workspace",
   read: "read",
   write: "write",
@@ -203,7 +205,7 @@ function serverInstructions(config: ServerConfig): string {
       : "";
 
   if (config.toolMode === "codex") {
-    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}`;
+    return `Use DevSpace for coding work. When the user has not supplied an exact project path, call ${toolNames.listProjects} first and use one of its returned paths. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -216,7 +218,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}`;
+  return `Use DevSpace for coding work. When the user has not supplied an exact project path, call ${toolNames.listProjects} first and use one of its returned paths. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -752,6 +754,87 @@ export function createMcpServer(
             },
           },
         ],
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    toolNames.listProjects,
+    {
+      title: "List available projects",
+      description:
+        "List the configured DevSpace roots and their immediate project directories. Use this before open_workspace when the user has not supplied an exact absolute project path.",
+      inputSchema: {},
+      outputSchema: {
+        result: z.string(),
+        roots: z.array(z.string()),
+        projects: z.array(z.object({
+          name: z.string(),
+          path: z.string(),
+          root: z.string(),
+        })),
+      },
+      ...toolWidgetDescriptorMeta(config, "workspace"),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async () => {
+      const startedAt = performance.now();
+      const projects = (
+        await Promise.all(config.allowedRoots.map(async (root) => {
+          const entries = await readdir(root, { withFileTypes: true });
+          return entries
+            .filter((entry) => entry.isDirectory())
+            .map((entry) => ({
+              name: entry.name,
+              path: join(root, entry.name),
+              root,
+            }));
+        }))
+      ).flat().sort((left, right) => left.path.localeCompare(right.path));
+      const lines = [
+        "Available DevSpace roots:",
+        ...config.allowedRoots.map((root) => `- ${root}`),
+        "",
+        "Immediate project directories:",
+        ...(projects.length > 0
+          ? projects.map((project) => `- ${project.name}: ${project.path}`)
+          : ["- No project directories found."]),
+      ];
+      const result = lines.join("\n");
+      const content: ToolContent[] = [{ type: "text", text: result }];
+
+      logToolCall(config, {
+        tool: toolNames.listProjects,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+
+      return {
+        content,
+        structuredContent: {
+          result,
+          roots: config.allowedRoots,
+          projects,
+        },
+        _meta: {
+          tool: toolNames.listProjects,
+          card: {
+            tool: toolNames.listProjects,
+            summary: {
+              roots: config.allowedRoots.length,
+              projects: projects.length,
+            },
+            roots: config.allowedRoots,
+            projects,
+            payload: { content },
+          },
+        },
       };
     },
   );
