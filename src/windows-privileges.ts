@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
-import { appendFile, mkdir } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -92,9 +93,10 @@ export async function requestWindowsAdminModeChange(
   const currentPrivilege = await currentWindowsPrivilegeLevel();
   const helperScript = buildAdminModeTransitionScript(taskName, enabled);
   const encodedHelper = encodePowerShell(helperScript);
-  const launcherScript = buildRunAsLauncherScript(encodedHelper, enabled);
+  const launchId = randomUUID();
+  const launcherScript = buildRunAsLauncherScript(encodedHelper, enabled, launchId);
 
-  await launchInteractivePowerShell(launcherScript, enabled);
+  await launchInteractivePowerShell(launcherScript, enabled, launchId);
 
   return {
     ok: true,
@@ -185,27 +187,27 @@ async function detectCurrentWindowsPrivilege(): Promise<WindowsPrivilegeLevel> {
   }
 }
 
-export function buildRunAsLauncherScript(encodedHelper: string, enabled: boolean): string {
+export function buildRunAsLauncherScript(encodedHelper: string, enabled: boolean, launchId = "test-launch"): string {
   const mode = enabled ? "enable" : "disable";
   return [
     `$ErrorActionPreference = 'Stop'`,
     `$logDir = Join-Path $env:USERPROFILE '.devspace\\logs'`,
     `$logPath = Join-Path $logDir 'admin-mode-launcher.log'`,
     `New-Item -ItemType Directory -Path $logDir -Force | Out-Null`,
-    `"$(Get-Date -Format o) launcher-start mode=${mode} session=$([System.Diagnostics.Process]::GetCurrentProcess().SessionId)" | Add-Content -LiteralPath $logPath`,
+    `"$(Get-Date -Format o) launcher-start id=${launchId} mode=${mode} session=$([System.Diagnostics.Process]::GetCurrentProcess().SessionId)" | Add-Content -LiteralPath $logPath`,
     `try {`,
     `  $powershell = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'`,
     `  $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', ${powershellLiteral(encodedHelper)})`,
     `  $process = Start-Process -FilePath $powershell -Verb RunAs -ArgumentList $arguments -PassThru -Wait`,
-    `  "$(Get-Date -Format o) launcher-finished mode=${mode} exitCode=$($process.ExitCode)" | Add-Content -LiteralPath $logPath`,
+    `  "$(Get-Date -Format o) launcher-finished id=${launchId} mode=${mode} exitCode=$($process.ExitCode)" | Add-Content -LiteralPath $logPath`,
     `} catch {`,
-    `  "$(Get-Date -Format o) launcher-failed mode=${mode} error=$($_.Exception.Message)" | Add-Content -LiteralPath $logPath`,
+    `  "$(Get-Date -Format o) launcher-failed id=${launchId} mode=${mode} error=$($_.Exception.Message)" | Add-Content -LiteralPath $logPath`,
     `  throw`,
     `}`,
   ].join("\r\n");
 }
 
-async function launchInteractivePowerShell(script: string, enabled: boolean): Promise<void> {
+async function launchInteractivePowerShell(script: string, enabled: boolean, launchId: string): Promise<void> {
   const mode = enabled ? "enable" : "disable";
   const logDir = join(homedir(), ".devspace", "logs");
   const parentLogPath = join(logDir, "admin-mode-parent.log");
@@ -237,12 +239,29 @@ async function launchInteractivePowerShell(script: string, enabled: boolean): Pr
       child.once("spawn", resolve);
       child.once("error", reject);
     });
-    await appendParentLog(parentLogPath, `parent-launch-spawned mode=${mode} pid=${child.pid ?? "unknown"}`);
+    await appendParentLog(parentLogPath, `parent-launch-spawned id=${launchId} mode=${mode} pid=${child.pid ?? "unknown"}`);
     child.unref();
+    await waitForLauncherHandshake(join(logDir, "admin-mode-launcher.log"), launchId);
+    await appendParentLog(parentLogPath, `parent-launch-ready id=${launchId} mode=${mode}`);
   } catch (error) {
     await appendParentLog(parentLogPath, `parent-launch-failed mode=${mode} error=${errorMessage(error)}`);
     throw error;
   }
+}
+
+async function waitForLauncherHandshake(path: string, launchId: string): Promise<void> {
+  const expected = `launcher-start id=${launchId} `;
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    try {
+      const content = await readFile(path, "utf8");
+      if (content.includes(expected)) return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("PowerShell launcher process was created but did not begin execution within 3 seconds. Security software may have blocked or terminated it.");
 }
 
 async function appendParentLog(path: string, message: string): Promise<void> {

@@ -35,7 +35,7 @@ test("administrator mode launcher requests an interactive RunAs elevation and lo
   assert.match(script, /-Verb RunAs/);
   assert.match(script, /-PassThru -Wait/);
   assert.match(script, /admin-mode-launcher\.log/);
-  assert.match(script, /launcher-start mode=enable/);
-  assert.match(script, /launcher-failed mode=enable/);
+  assert.match(script, /launcher-start id=test-launch mode=enable/);
+  assert.match(script, /launcher-failed id=test-launch mode=enable/);
   assert.doesNotMatch(script, /WindowStyle.*Hidden/);
 });
