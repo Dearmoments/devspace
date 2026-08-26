@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { access, readdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
@@ -500,6 +501,20 @@ function setAssetHeaders(res: Response): void {
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
 }
 
+function isLocalAdminRequest(req: Request): boolean {
+  const host = (req.hostname ?? "").toLowerCase();
+  return host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1";
+}
+
+async function discoverProjects(config: ServerConfig): Promise<Array<{ name: string; path: string; root: string }>> {
+  return (await Promise.all(config.allowedRoots.map(async (root) => {
+    const entries = await readdir(root, { withFileTypes: true });
+    return entries.filter((entry) => entry.isDirectory()).map((entry) => ({
+      name: entry.name, path: join(root, entry.name), root,
+    }));
+  }))).flat().sort((left, right) => left.path.localeCompare(right.path));
+}
+
 async function assertWorkspaceAppAssets(): Promise<void> {
   const entry = getWorkspaceAppManifestEntry();
   const candidates = [entry.file, ...(entry.css ?? [])].map(
@@ -785,18 +800,7 @@ export function createMcpServer(
     },
     async () => {
       const startedAt = performance.now();
-      const projects = (
-        await Promise.all(config.allowedRoots.map(async (root) => {
-          const entries = await readdir(root, { withFileTypes: true });
-          return entries
-            .filter((entry) => entry.isDirectory())
-            .map((entry) => ({
-              name: entry.name,
-              path: join(root, entry.name),
-              root,
-            }));
-        }))
-      ).flat().sort((left, right) => left.path.localeCompare(right.path));
+      const projects = await discoverProjects(config);
       const lines = [
         "Available DevSpace roots:",
         ...config.allowedRoots.map((root) => `- ${root}`),
@@ -1874,6 +1878,29 @@ export function createServer(
       setHeaders: setAssetHeaders,
     }),
   );
+
+  app.use("/assets", express.static(uiBuildDirectory(), { immutable: true, maxAge: "1y" }));
+  app.get("/admin", (req, res) => {
+    if (!isLocalAdminRequest(req)) return res.status(404).send("Not found");
+    res.sendFile(join(uiBuildDirectory(), "admin.html"));
+  });
+  app.get("/api/admin/status", (req, res) => {
+    if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
+    res.json({ ok: true, name: "DevSpace", port: config.port, publicBaseUrl: config.publicBaseUrl, allowedRoots: config.allowedRoots });
+  });
+  app.get("/api/admin/projects", async (req, res) => {
+    if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
+    try { res.json({ projects: await discoverProjects(config) }); }
+    catch (error) { res.status(500).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.post("/api/admin/open-folder", express.json(), async (req, res) => {
+    if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
+    const target = typeof req.body?.path === "string" ? req.body.path : "";
+    const projects = await discoverProjects(config);
+    if (!projects.some((project) => project.path === target)) return res.status(400).json({ error: "Path is not an allowed project" });
+    spawn("explorer.exe", [target], { detached: true, stdio: "ignore" }).unref();
+    res.json({ ok: true });
+  });
 
   app.get("/healthz", (_req, res) => {
     res.json({ ok: true, name: "devspace" });
