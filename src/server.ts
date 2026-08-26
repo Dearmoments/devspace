@@ -1914,7 +1914,7 @@ export function createServer(
   }, MCP_SESSION_CLEANUP_INTERVAL_MS);
   sessionCleanupTimer.unref();
 
-  if (config.logging.trustProxy) {
+  if (config.logging.trustProxy || process.env.DEVSPACE_SUPERVISOR_CHILD === "1") {
     app.set("trust proxy", 1);
   }
 
