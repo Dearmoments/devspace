@@ -1882,7 +1882,9 @@ export function createServer(
   app.use("/assets", express.static(uiBuildDirectory(), { immutable: true, maxAge: "1y" }));
   app.get("/admin", (req, res) => {
     if (!isLocalAdminRequest(req)) return res.status(404).send("Not found");
-    res.sendFile(join(uiBuildDirectory(), "admin.html"));
+    const html = readFileSync(join(uiBuildDirectory(), "admin.html"), "utf8")
+      .replaceAll("./assets/", "/mcp-app-assets/assets/");
+    res.type("html").send(html);
   });
   app.get("/api/admin/status", (req, res) => {
     if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
