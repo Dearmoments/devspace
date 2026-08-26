@@ -58,6 +58,7 @@ import {
   writeFileTool,
 } from "./pi-tools.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
+import { currentWindowsPrivilegeLevel } from "./windows-privileges.js";
 import {
   McpSessionRegistry,
   type McpSessionCloseResult,
@@ -1975,9 +1976,10 @@ export function createServer(
     res.type("html").send(html);
   });
   app.use("/api/admin", express.json());
-  app.get("/api/admin/status", (req, res) => {
+  app.get("/api/admin/status", async (req, res) => {
     if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
     const tools = adminCoreToolStates(config);
+    const windowsPrivilege = await currentWindowsPrivilegeLevel();
     res.json({
       ok: true,
       name: "DevSpace",
@@ -2003,6 +2005,7 @@ export function createServer(
         disabledTools: config.disabledTools,
       },
       providers: resolveLocalAgentProviders(),
+      windowsPrivilege,
     });
   });
   app.get("/api/admin/services", async (req, res) => {

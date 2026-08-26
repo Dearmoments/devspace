@@ -6,6 +6,8 @@ type PageId = "overview" | "services" | "plugins" | "mcp" | "workspaces" | "netw
 type ToolMode = "minimal" | "full" | "codex";
 type WidgetMode = "off" | "changes" | "full";
 type ServiceState = "running" | "stopped" | "unavailable" | "unknown";
+type PrivilegeLevel = "administrator" | "limited" | "unknown" | "unsupported";
+type TaskRunLevel = "highest" | "limited" | "unknown" | "missing" | "unsupported";
 
 type Project = { name: string; path: string; root: string };
 type ToolState = { name: string; available: boolean; enabled: boolean };
@@ -41,6 +43,13 @@ type AdminStatus = {
     uptimeSeconds: number;
     port: number;
     backendPort: number;
+  };
+  privileges?: {
+    supported: boolean;
+    supervisor: PrivilegeLevel;
+    mcpServer: PrivilegeLevel;
+    taskRunLevel: TaskRunLevel;
+    adminMode: boolean;
   };
 };
 type AdminService = {
@@ -93,6 +102,10 @@ function postJson<T>(url: string, body: unknown = {}): Promise<T> {
 
 function stateLabel(state: ServiceState): string {
   return ({ running: "Running", stopped: "Stopped", unavailable: "Unavailable", unknown: "Unknown" })[state];
+}
+
+function privilegeLabel(level: PrivilegeLevel): string {
+  return ({ administrator: "Administrator", limited: "Limited", unknown: "Unknown", unsupported: "Unsupported" })[level];
 }
 
 function formatDuration(totalSeconds: number): string {
@@ -234,6 +247,28 @@ function App() {
     }
   };
 
+  const setAdminMode = async (enabled: boolean) => {
+    setBusy("admin-mode");
+    try {
+      const result = await postJson<{ uacRequested: boolean; restarting: boolean }>("/api/admin/privileges/admin-mode", { enabled });
+      showNotice(
+        "warn",
+        enabled
+          ? result.uacRequested
+            ? "已请求 Windows UAC；批准后 Supervisor 会以管理员权限重启"
+            : "正在以管理员模式重启 Supervisor"
+          : result.uacRequested
+            ? "已请求 Windows UAC；批准后将关闭管理员模式并重启 Supervisor"
+            : "正在关闭管理员模式并重启 Supervisor",
+      );
+      window.setTimeout(() => void loadStatus().catch(() => undefined), 3_000);
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const toggleTool = async (name: string, enabled: boolean) => {
     if (!status) return;
     const disabledTools = enabled
@@ -312,7 +347,7 @@ function App() {
         }} onCopy={async (path) => { await navigator.clipboard.writeText(path); showNotice("ok", "路径已复制"); }} />}
         {page === "network" && status && <Network status={status} />}
         {page === "logs" && <Logs source={logSource} setSource={setLogSource} lines={logs} onRefresh={() => loadLogs()} />}
-        {page === "settings" && status && <Settings status={status} roots={rootDrafts} setRoots={setRootDrafts} busy={busy} onSave={async (patch) => {
+        {page === "settings" && status && <Settings status={status} roots={rootDrafts} setRoots={setRootDrafts} busy={busy} onAdminMode={setAdminMode} onSave={async (patch) => {
           await saveSettings(patch, "系统设置已保存");
           setRootDrafts((await loadStatus()).allowedRoots);
         }} />}
@@ -459,7 +494,7 @@ function Logs({ source, setSource, lines, onRefresh }: { source: "server" | "tun
   </>;
 }
 
-function Settings({ status, roots, setRoots, busy, onSave }: { status: AdminStatus; roots: string[]; setRoots: (roots: string[]) => void; busy: string | null; onSave: (patch: Record<string, unknown>) => Promise<void> }) {
+function Settings({ status, roots, setRoots, busy, onAdminMode, onSave }: { status: AdminStatus; roots: string[]; setRoots: (roots: string[]) => void; busy: string | null; onAdminMode: (enabled: boolean) => Promise<void>; onSave: (patch: Record<string, unknown>) => Promise<void> }) {
   const [toolMode, setToolMode] = useState<ToolMode>(status.settings.toolMode);
   const [widgets, setWidgets] = useState<WidgetMode>(status.settings.widgets);
   useEffect(() => { setToolMode(status.settings.toolMode); setWidgets(status.settings.widgets); }, [status.settings.toolMode, status.settings.widgets]);
@@ -469,6 +504,19 @@ function Settings({ status, roots, setRoots, busy, onSave }: { status: AdminStat
     <div className="settings-grid">
       <section className="panel settings-panel wide"><div className="settings-title"><div><h2>Allowed Roots</h2><p>允许 DevSpace 打开工作区的文件系统边界。</p></div><button className="secondary" onClick={() => setRoots([...roots, ""])}>＋ 添加 Root</button></div>
         <div className="root-editor">{roots.map((root, index) => <div key={`${index}:${root}`}><input value={root} placeholder="E:\\Projects" onChange={(event) => setRoots(roots.map((value, position) => position === index ? event.target.value : value))} /><button className="danger-soft" disabled={roots.length <= 1} onClick={() => setRoots(roots.filter((_, position) => position !== index))}>删除</button></div>)}</div>
+      </section>
+      <section className="panel settings-panel wide permission-panel">
+        <div className="settings-title"><div><h2>权限与启动</h2><p>切换 Windows 计划任务的 RunLevel。开启后 Supervisor 与它启动的 MCP Server 都会继承管理员令牌。</p></div></div>
+        {status.privileges ? <div className="permission-console">
+          <div className="permission-console-title">Windows 权限</div>
+          <div className="permission-row"><span>Supervisor</span><strong className={status.privileges.supervisor === "administrator" ? "admin" : "limited"}>{privilegeLabel(status.privileges.supervisor)}</strong></div>
+          <div className="permission-row"><span>MCP Server</span><strong className={status.privileges.mcpServer === "administrator" ? "admin" : "limited"}>{status.backendRunning ? privilegeLabel(status.privileges.mcpServer) : "Stopped"}</strong></div>
+          <div className="permission-separator" />
+          <div className="permission-row admin-mode-row"><span>管理员模式</span><strong className={status.privileges.adminMode ? "admin" : "limited"}>{status.privileges.adminMode ? "ON" : "OFF"}</strong></div>
+          <div className="permission-task-meta"><span>DevSpace Server RunLevel</span><code>{status.privileges.taskRunLevel === "highest" ? "Highest" : status.privileges.taskRunLevel === "limited" ? "Limited" : status.privileges.taskRunLevel}</code></div>
+          <button className={status.privileges.adminMode ? "danger-soft admin-mode-button" : "primary admin-mode-button"} disabled={!status.privileges.supported || busy === "admin-mode"} onClick={() => void onAdminMode(!status.privileges!.adminMode)}>{busy === "admin-mode" ? "正在切换…" : status.privileges.adminMode ? "关闭管理员模式" : "启用管理员模式"}</button>
+        </div> : <div className="permission-console"><div className="empty-inline">权限状态不可用。</div></div>}
+        <div className="permission-warning"><span>!</span><p><strong>这是全局权限模式。</strong>开启后所有连接到当前 DevSpace MCP Server 的对话和工具调用都会获得管理员权限，不是仅当前对话。启用时 Windows 会弹出一次 UAC；批准后页面会短暂断线并自动恢复。</p></div>
       </section>
       <section className="panel settings-panel"><h2>MCP Tool Mode</h2><p>决定默认工具面。Full 对应当前 9 个核心工具。</p><select value={toolMode} onChange={(event) => setToolMode(event.target.value as ToolMode)}><option value="minimal">minimal · 精简</option><option value="full">full · 完整</option><option value="codex">codex · Codex 兼容</option></select><div className="setting-current"><span>当前运行值</span><strong>{status.settings.toolMode}</strong></div></section>
       <section className="panel settings-panel"><h2>Widget Mode</h2><p>控制 MCP 工具结果是否附带 DevSpace 卡片。</p><select value={widgets} onChange={(event) => setWidgets(event.target.value as WidgetMode)}><option value="full">full · 完整卡片</option><option value="changes">changes · 变更审阅</option><option value="off">off · 关闭</option></select><div className="setting-current"><span>当前运行值</span><strong>{status.settings.widgets}</strong></div></section>

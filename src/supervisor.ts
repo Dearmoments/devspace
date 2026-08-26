@@ -20,6 +20,11 @@ import { loadConfig, type ServerConfig } from "./config.js";
 import { getLocalAgentProviderAvailabilitySnapshot } from "./local-agent-availability.js";
 import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
 import { LocalAgentClient } from "./local-agent-client.js";
+import {
+  normalizeWindowsPrivilegeLevel,
+  requestWindowsAdminModeChange,
+  windowsAdminModeSnapshot,
+} from "./windows-privileges.js";
 
 const DEVSPACE_VERSION = (
   JSON.parse(
@@ -376,6 +381,7 @@ export function createSupervisor(
     const backend = await tryBackendJson<Record<string, unknown>>(backendPort, "/api/admin/status");
     const tools = adminCoreToolStates(config);
     const backendSnapshot = controller.snapshot();
+    const privileges = await windowsAdminModeSnapshot(normalizeWindowsPrivilegeLevel(backend?.windowsPrivilege));
     res.json({
       ...(backend ?? {}),
       ok: true,
@@ -409,7 +415,20 @@ export function createSupervisor(
         port: config.port,
         backendPort,
       },
+      privileges,
     });
+  });
+
+  app.post("/api/admin/privileges/admin-mode", async (req, res) => {
+    if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
+    if (typeof req.body?.enabled !== "boolean") {
+      return res.status(400).json({ error: "enabled must be boolean." });
+    }
+    try {
+      res.json(await requestWindowsAdminModeChange(req.body.enabled));
+    } catch (error) {
+      res.status(500).json({ error: errorMessage(error) });
+    }
   });
 
   app.get("/api/admin/services", async (req, res) => {
