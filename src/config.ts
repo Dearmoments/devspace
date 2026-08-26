@@ -21,6 +21,7 @@ export interface ServerConfig {
   publicBaseUrl: string;
   toolMode: ToolMode;
   widgets: WidgetMode;
+  disabledTools: string[];
   stateDir: string;
   worktreeRoot: string;
   artifactsEnabled: boolean;
@@ -85,7 +86,7 @@ function parseBoolean(value: string | undefined): boolean {
   return ["1", "true", "yes", "on"].includes(value?.toLowerCase() ?? "");
 }
 
-function parseToolMode(env: NodeJS.ProcessEnv): ToolMode {
+function parseToolMode(env: NodeJS.ProcessEnv, storedMode?: ToolMode): ToolMode {
   const mode = env.DEVSPACE_TOOL_MODE;
   if (mode === "minimal" || mode === "full" || mode === "codex") return mode;
   if (mode) throw new Error(`Invalid DEVSPACE_TOOL_MODE: ${mode}`);
@@ -93,7 +94,7 @@ function parseToolMode(env: NodeJS.ProcessEnv): ToolMode {
   if (env.DEVSPACE_MINIMAL_TOOLS !== undefined) {
     return parseBoolean(env.DEVSPACE_MINIMAL_TOOLS) ? "minimal" : "full";
   }
-  return "minimal";
+  return storedMode ?? "minimal";
 }
 
 function parseLogLevel(value: string | undefined): LogLevel {
@@ -231,8 +232,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     allowedRoots: parseAllowedRoots(env.DEVSPACE_ALLOWED_ROOTS ?? files.config.allowedRoots),
     allowedHosts: parseAllowedHosts(env.DEVSPACE_ALLOWED_HOSTS, derivedAllowedHosts),
     publicBaseUrl,
-    toolMode: parseToolMode(env),
-    widgets: parseWidgetMode(env.DEVSPACE_WIDGETS),
+    toolMode: parseToolMode(env, files.config.toolMode),
+    widgets: parseWidgetMode(env.DEVSPACE_WIDGETS ?? files.config.widgets),
+    disabledTools: Array.from(new Set(
+      env.DEVSPACE_DISABLED_TOOLS === undefined
+        ? files.config.disabledTools ?? []
+        : parsePathList(env.DEVSPACE_DISABLED_TOOLS),
+    )),
     stateDir: resolve(expandHomePath(env.DEVSPACE_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
     worktreeRoot: resolve(expandHomePath(env.DEVSPACE_WORKTREE_ROOT ?? files.config.worktreeRoot ?? defaultWorktreeRoot())),
     artifactsEnabled:
@@ -244,8 +250,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       DEFAULT_ARTIFACT_MAX_FILE_BYTES,
       "DEVSPACE_ARTIFACT_MAX_FILE_BYTES",
     ),
-    skillsEnabled: env.DEVSPACE_SKILLS === undefined ? true : parseBoolean(env.DEVSPACE_SKILLS),
-    skillPaths: parsePathList(env.DEVSPACE_SKILL_PATHS),
+    skillsEnabled:
+      env.DEVSPACE_SKILLS === undefined
+        ? files.config.skillsEnabled ?? true
+        : parseBoolean(env.DEVSPACE_SKILLS),
+    skillPaths:
+      env.DEVSPACE_SKILL_PATHS === undefined
+        ? files.config.skillPaths ?? []
+        : parsePathList(env.DEVSPACE_SKILL_PATHS),
     devspaceSkillsDir: devspaceSkillsDir(env),
     devspaceAgentsDir: devspaceAgentsDir(env),
     subagents: resolveSubagentsConfig(files.config.subagents, env),

@@ -22,6 +22,7 @@ assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "codex" }).toolMode, "
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "0" }).toolMode, "full");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "1" }).toolMode, "minimal");
 assert.equal(loadConfig(baseEnv).skillsEnabled, true);
+assert.deepEqual(loadConfig(baseEnv).disabledTools, []);
 assert.equal(loadConfig(baseEnv).devspaceSkillsDir, join(emptyConfigDir, "skills"));
 assert.equal(loadConfig(baseEnv).devspaceAgentsDir, join(emptyConfigDir, "agents"));
 assert.deepEqual(loadConfig(baseEnv).subagents, { enabled: false, providers: [] });
@@ -160,6 +161,11 @@ writeFileSync(
     port: 8787,
     allowedRoots: [process.cwd()],
     publicBaseUrl: "https://devspace.example.com",
+    toolMode: "full",
+    widgets: "changes",
+    disabledTools: ["bash"],
+    skillsEnabled: false,
+    skillPaths: ["./skills-extra"],
     subagents: true,
     artifactsEnabled: true,
     artifactMaxFileBytes: 321,
@@ -176,6 +182,11 @@ const fileConfig = loadConfig({ DEVSPACE_CONFIG_DIR: configDir });
 assert.equal(fileConfig.port, 8787);
 assert.equal(fileConfig.oauth.ownerToken, "persisted-owner-token-long-enough");
 assert.equal(fileConfig.publicBaseUrl, "https://devspace.example.com");
+assert.equal(fileConfig.toolMode, "full");
+assert.equal(fileConfig.widgets, "changes");
+assert.deepEqual(fileConfig.disabledTools, ["bash"]);
+assert.equal(fileConfig.skillsEnabled, false);
+assert.deepEqual(fileConfig.skillPaths, ["./skills-extra"]);
 assert.equal(fileConfig.subagents.enabled, true);
 assert.equal(fileConfig.subagents.providers.length, 7);
 assert.equal(fileConfig.artifactsEnabled, true);

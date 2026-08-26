@@ -21,11 +21,16 @@ const registry = new McpSessionRegistry<FakeTransport>({ now: () => now });
 const staleTransport = createTransport();
 const activeTransport = createTransport();
 
-registry.register("stale", staleTransport);
+registry.register("stale", staleTransport, { client: "old-host" });
 now = 1_000;
-registry.register("active", activeTransport);
+registry.register("active", activeTransport, { client: "chatgpt" });
+assert.deepEqual(registry.list(), [
+  { sessionId: "stale", connectedAt: 0, lastActivityAt: 0, client: "old-host" },
+  { sessionId: "active", connectedAt: 1_000, lastActivityAt: 1_000, client: "chatgpt" },
+]);
 now = 1_500;
 assert.equal(registry.get("active"), activeTransport);
+assert.equal(registry.list().find((session) => session.sessionId === "active")?.lastActivityAt, 1_500);
 now = 2_000;
 
 const idleResults = await registry.closeIdle(1_500);
@@ -35,6 +40,13 @@ assert.equal(activeTransport.closeCalls, 0);
 assert.equal(registry.size, 1);
 assert.equal(registry.get("stale"), undefined);
 assert.equal(registry.get("active"), activeTransport);
+
+const targetedTransport = createTransport();
+registry.register("targeted", targetedTransport);
+const targetedResult = await registry.close("targeted");
+assert.deepEqual(targetedResult, { sessionId: "targeted" });
+assert.equal(targetedTransport.closeCalls, 1);
+assert.equal(await registry.close("missing"), undefined);
 
 const closeError = new Error("close failed");
 const failingTransport = createTransport(closeError);

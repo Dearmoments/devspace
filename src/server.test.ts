@@ -50,6 +50,16 @@ test("list_projects discovers allowed roots before a workspace is opened", async
   assert.equal(responseCard(result).tool, "list_projects");
 });
 
+test("admin-disabled core tools are omitted from tools/list", async (t) => {
+  const context = await fixture(t, { disabledTools: ["bash", "grep"] });
+  const tools = await context.client.listTools();
+  const names = tools.tools.map((tool) => tool.name);
+  assert.equal(names.includes("bash"), false);
+  assert.equal(names.includes("grep"), false);
+  assert.equal(names.includes("list_projects"), true);
+  assert.equal(names.includes("open_workspace"), true);
+});
+
 test("open_workspace keeps lifecycle flags out of model output and preserves complete card metadata", async (t) => {
   const providerNote = "available";
   const context = await fixture(t, {
@@ -278,6 +288,7 @@ async function fixture(
     git?: boolean;
     localAgentProviders?: LocalAgentProviderAvailability[] | (() => LocalAgentProviderAvailability[]);
     subagents?: SubagentsConfig;
+    disabledTools?: string[];
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -317,6 +328,7 @@ async function fixture(
     DEVSPACE_AGENT_DIR: agentDir,
     DEVSPACE_WIDGETS: "full",
     DEVSPACE_TOOL_MODE: "full",
+    DEVSPACE_DISABLED_TOOLS: options.disabledTools?.join(",") ?? "",
     DEVSPACE_SUBAGENTS: options.localAgentProviders ? "1" : "0",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",

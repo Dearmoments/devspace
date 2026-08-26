@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { access, readdir, realpath } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
@@ -24,7 +24,13 @@ import {
   isArtifactDownloadSupportedPlatform,
   registerArtifactTools,
 } from "./artifact-tools.js";
-import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
+import { loadConfig, type ServerConfig, type ToolMode, type WidgetMode } from "./config.js";
+import {
+  controlScheduledTask,
+  readAdminLog,
+  scheduledTaskSnapshot,
+  type AdminServiceStatus,
+} from "./admin-control.js";
 import {
   createOpenAIIncomingArtifactAdapter,
   type IncomingArtifactAdapter,
@@ -36,6 +42,7 @@ import {
   commandPreview,
   sessionIdPrefix,
 } from "./logger.js";
+import { LocalAgentClient } from "./local-agent-client.js";
 import {
   editFileTool,
   findFilesTool,
@@ -54,7 +61,9 @@ import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { openAiConversationScopeId } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
+import { expandHomePath } from "./roots.js";
 import { formatPathForPrompt } from "./skills.js";
+import { loadDevspaceFiles, writeDevspaceConfig } from "./user-config.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import {
@@ -186,6 +195,30 @@ const toolNames = {
   shell: "bash",
 } as const;
 
+const adminCoreTools = Object.values(toolNames);
+
+function isCoreToolEnabled(config: ServerConfig, tool: string): boolean {
+  return !config.disabledTools.includes(tool);
+}
+
+function coreToolModeAvailable(config: ServerConfig, tool: string): boolean {
+  if (config.toolMode === "codex") {
+    return new Set<string>([toolNames.listProjects, toolNames.openWorkspace, toolNames.read]).has(tool);
+  }
+  if (config.toolMode === "minimal") {
+    return !new Set<string>([toolNames.grep, toolNames.glob, toolNames.ls]).has(tool);
+  }
+  return true;
+}
+
+function adminCoreToolStates(config: ServerConfig) {
+  return adminCoreTools.map((name) => ({
+    name,
+    available: coreToolModeAvailable(config, name),
+    enabled: coreToolModeAvailable(config, name) && isCoreToolEnabled(config, name),
+  }));
+}
+
 const workspaceIdDescription =
   "Workspace to use. Reuse the current project's workspaceId.";
 
@@ -202,6 +235,9 @@ interface ToolLogFields {
 }
 
 function serverInstructions(config: ServerConfig): string {
+  const disabledToolsInstruction = config.disabledTools.length > 0
+    ? ` Tools disabled by the local DevSpace administrator: ${config.disabledTools.join(", ")}. Do not attempt to call disabled tools.`
+    : "";
   const artifactInstruction = config.artifactsEnabled && isArtifactDownloadSupportedPlatform()
     ? " When the user supplies or generates a file that is not present on the DevSpace host, use download_artifact with its native file value, the existing workspace ID, and a suitable relative destination path chosen from the user's request and project structure. The tool refuses to overwrite an existing destination and returns the normalized workspace-relative path. Use normal workspace tools when explicit inspection, replacement, movement, renaming, or deletion is needed. Do not recreate binary files with write/edit calls or place signed URLs, native file objects, base64 content, or invented host paths in shell commands or logs."
     : "";
@@ -211,7 +247,7 @@ function serverInstructions(config: ServerConfig): string {
       : "";
 
   if (config.toolMode === "codex") {
-    return `Use DevSpace for coding work. When the user has not supplied an exact project path, call ${toolNames.listProjects} first and use one of its returned paths. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}`;
+    return `Use DevSpace for coding work. When the user has not supplied an exact project path, call ${toolNames.listProjects} first and use one of its returned paths. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${disabledToolsInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -224,7 +260,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use DevSpace for coding work. When the user has not supplied an exact project path, call ${toolNames.listProjects} first and use one of its returned paths. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}`;
+  return `Use DevSpace for coding work. When the user has not supplied an exact project path, call ${toolNames.listProjects} first and use one of its returned paths. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${disabledToolsInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -520,6 +556,80 @@ async function discoverProjects(config: ServerConfig): Promise<Array<{ name: str
   }))).flat().sort((left, right) => left.path.localeCompare(right.path));
 }
 
+function applyAdminSettings(config: ServerConfig, body: unknown): void {
+  if (!body || typeof body !== "object") throw new Error("Settings body must be an object.");
+  const input = body as Record<string, unknown>;
+
+  if (input.allowedRoots !== undefined) {
+    if (!Array.isArray(input.allowedRoots) || input.allowedRoots.length === 0) {
+      throw new Error("allowedRoots must contain at least one path.");
+    }
+    const roots = input.allowedRoots.map((value) => {
+      if (typeof value !== "string" || !value.trim()) throw new Error("Each allowed root must be a non-empty path.");
+      return resolve(expandHomePath(value.trim()));
+    });
+    config.allowedRoots = Array.from(new Set(roots));
+  }
+
+  if (input.toolMode !== undefined) {
+    if (!isToolMode(input.toolMode)) throw new Error("Invalid toolMode.");
+    config.toolMode = input.toolMode;
+  }
+  if (input.widgets !== undefined) {
+    if (!isWidgetMode(input.widgets)) throw new Error("Invalid widgets mode.");
+    config.widgets = input.widgets;
+  }
+  if (input.disabledTools !== undefined) {
+    if (!Array.isArray(input.disabledTools)) throw new Error("disabledTools must be an array.");
+    const tools = input.disabledTools.map((value) => {
+      if (typeof value !== "string" || !adminCoreTools.includes(value as typeof adminCoreTools[number])) {
+        throw new Error(`Unknown core tool: ${String(value)}`);
+      }
+      return value;
+    });
+    config.disabledTools = Array.from(new Set(tools));
+  }
+  if (input.skillsEnabled !== undefined) {
+    if (typeof input.skillsEnabled !== "boolean") throw new Error("skillsEnabled must be boolean.");
+    config.skillsEnabled = input.skillsEnabled;
+  }
+  if (input.artifactsEnabled !== undefined) {
+    if (typeof input.artifactsEnabled !== "boolean") throw new Error("artifactsEnabled must be boolean.");
+    config.artifactsEnabled = input.artifactsEnabled;
+  }
+  if (input.subagentsEnabled !== undefined) {
+    if (typeof input.subagentsEnabled !== "boolean") throw new Error("subagentsEnabled must be boolean.");
+    config.subagents = { ...config.subagents, enabled: input.subagentsEnabled };
+  }
+}
+
+function persistAdminSettings(config: ServerConfig): string {
+  const files = loadDevspaceFiles();
+  return writeDevspaceConfig({
+    ...files.config,
+    allowedRoots: config.allowedRoots,
+    toolMode: config.toolMode,
+    widgets: config.widgets,
+    disabledTools: config.disabledTools,
+    skillsEnabled: config.skillsEnabled,
+    skillPaths: config.skillPaths,
+    artifactsEnabled: config.artifactsEnabled,
+    subagents: config.subagents,
+  });
+}
+
+function isToolMode(value: unknown): value is ToolMode {
+  return value === "minimal" || value === "full" || value === "codex";
+}
+
+function isWidgetMode(value: unknown): value is WidgetMode {
+  return value === "off" || value === "changes" || value === "full";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 async function assertWorkspaceAppAssets(): Promise<void> {
   const entry = getWorkspaceAppManifestEntry();
   const candidates = [entry.file, ...(entry.css ?? [])].map(
@@ -778,6 +888,7 @@ export function createMcpServer(
     },
   );
 
+  if (isCoreToolEnabled(config, toolNames.listProjects)) {
   registerAppTool(
     server,
     toolNames.listProjects,
@@ -847,7 +958,9 @@ export function createMcpServer(
       };
     },
   );
+  }
 
+  if (isCoreToolEnabled(config, toolNames.openWorkspace)) {
   registerAppTool(
     server,
     "open_workspace",
@@ -1049,7 +1162,9 @@ export function createMcpServer(
       };
     },
   );
+  }
 
+  if (isCoreToolEnabled(config, toolNames.read)) {
   registerAppTool(
     server,
     toolNames.read,
@@ -1146,8 +1261,9 @@ export function createMcpServer(
       };
     },
   );
+  }
 
-  if (config.toolMode !== "codex") {
+  if (config.toolMode !== "codex" && isCoreToolEnabled(config, toolNames.write)) {
   registerAppTool(
     server,
     toolNames.write,
@@ -1221,7 +1337,9 @@ export function createMcpServer(
       };
     },
   );
+  }
 
+  if (config.toolMode !== "codex" && isCoreToolEnabled(config, toolNames.edit)) {
   registerAppTool(
     server,
     toolNames.edit,
@@ -1444,6 +1562,7 @@ export function createMcpServer(
   }
 
   if (config.toolMode === "full") {
+    if (isCoreToolEnabled(config, toolNames.grep)) {
     registerAppTool(
       server,
       toolNames.grep,
@@ -1516,7 +1635,9 @@ export function createMcpServer(
         };
       },
     );
+    }
 
+    if (isCoreToolEnabled(config, toolNames.glob)) {
     registerAppTool(
       server,
       toolNames.glob,
@@ -1586,7 +1707,9 @@ export function createMcpServer(
         };
       },
     );
+    }
 
+    if (isCoreToolEnabled(config, toolNames.ls)) {
     registerAppTool(
       server,
       toolNames.ls,
@@ -1652,9 +1775,10 @@ export function createMcpServer(
         };
       },
     );
+    }
   }
 
-  if (config.toolMode !== "codex") {
+  if (config.toolMode !== "codex" && isCoreToolEnabled(config, toolNames.shell)) {
   registerAppTool(
     server,
     toolNames.shell,
@@ -1799,9 +1923,65 @@ export function createServer(
     config.subagents,
     getLocalAgentProviderAvailabilitySnapshot(),
   );
+  const localAgentClient = new LocalAgentClient({ stateDir: config.stateDir });
+  let schemaRevision = 1;
+
+  const resolveAdminServices = async (): Promise<AdminServiceStatus[]> => {
+    const [cloudflareTask, reverseSshTask, daemonStatus] = await Promise.all([
+      scheduledTaskSnapshot("DevSpace Cloudflare Tunnel"),
+      scheduledTaskSnapshot("DevSpace Reverse SSH"),
+      localAgentClient.status(),
+    ]);
+    const daemonState = daemonStatus.isErr() ? "stopped" : "running";
+    const daemonPid = daemonStatus.isErr() ? undefined : daemonStatus.value.pid;
+
+    return [
+      {
+        id: "devspace-server",
+        name: "DevSpace MCP Server",
+        description: "当前提供 MCP 与本地控制台的核心进程。",
+        state: "running",
+        pid: process.pid,
+        endpoint: `http://${config.host}:${config.port}/mcp`,
+        controllable: false,
+        actions: ["logs"],
+        note: "当前控制台与 MCP Server 同进程；停止后控制台也会离线。独立 Supervisor 将在下一阶段接管启停。",
+      },
+      {
+        id: "cloudflare-tunnel",
+        name: "Cloudflare Tunnel",
+        description: "DevSpace 公网 HTTPS 隧道。",
+        state: cloudflareTask.state,
+        taskName: cloudflareTask.taskName,
+        endpoint: config.publicBaseUrl,
+        controllable: cloudflareTask.state !== "unavailable",
+        actions: ["start", "stop", "restart", "logs"],
+      },
+      {
+        id: "agent-daemon",
+        name: "Agent Daemon",
+        description: "本地子代理运行守护进程。",
+        state: daemonState,
+        pid: daemonPid,
+        controllable: true,
+        actions: ["start", "stop", "restart", "logs"],
+        note: daemonStatus.isErr() ? daemonStatus.error.message : undefined,
+      },
+      {
+        id: "reverse-ssh",
+        name: "Reverse SSH",
+        description: "备用反向 SSH 通道。",
+        state: reverseSshTask.state,
+        taskName: reverseSshTask.taskName,
+        controllable: reverseSshTask.state !== "unavailable",
+        actions: ["start", "stop", "restart", "logs"],
+        note: reverseSshTask.state === "unavailable" ? "当前未注册 DevSpace Reverse SSH 计划任务。" : undefined,
+      },
+    ];
+  };
 
   const logSessionCloseResults = (
-    reason: "idle_timeout" | "server_shutdown",
+    reason: "idle_timeout" | "server_shutdown" | "admin_disconnect" | "schema_reload",
     results: McpSessionCloseResult[],
   ) => {
     for (const result of results) {
@@ -1891,16 +2071,175 @@ export function createServer(
       .replaceAll("./assets/", "/mcp-app-assets/assets/");
     res.type("html").send(html);
   });
+  app.use("/api/admin", express.json());
   app.get("/api/admin/status", (req, res) => {
     if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
-    res.json({ ok: true, name: "DevSpace", port: config.port, publicBaseUrl: config.publicBaseUrl, allowedRoots: config.allowedRoots });
+    const tools = adminCoreToolStates(config);
+    res.json({
+      ok: true,
+      name: "DevSpace",
+      version: DEVSPACE_VERSION,
+      pid: process.pid,
+      uptimeSeconds: Math.round(process.uptime()),
+      host: config.host,
+      port: config.port,
+      publicBaseUrl: config.publicBaseUrl,
+      mcpUrl: new URL("/mcp", config.publicBaseUrl).toString(),
+      allowedRoots: config.allowedRoots,
+      allowedHosts: config.allowedHosts,
+      schemaRevision,
+      sessionCount: transports.size,
+      tools,
+      exposedCoreToolCount: tools.filter((tool) => tool.enabled).length,
+      settings: {
+        toolMode: config.toolMode,
+        widgets: config.widgets,
+        skillsEnabled: config.skillsEnabled,
+        subagentsEnabled: config.subagents.enabled,
+        artifactsEnabled: config.artifactsEnabled,
+        disabledTools: config.disabledTools,
+      },
+      providers: resolveLocalAgentProviders(),
+    });
+  });
+  app.get("/api/admin/services", async (req, res) => {
+    if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
+    try {
+      res.json({ services: await resolveAdminServices() });
+    } catch (error) {
+      res.status(500).json({ error: errorMessage(error) });
+    }
+  });
+  app.post("/api/admin/services/:id/:action", async (req, res) => {
+    if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
+    const action = req.params.action;
+    if (action !== "start" && action !== "stop" && action !== "restart") {
+      return res.status(400).json({ error: "Unsupported service action." });
+    }
+
+    try {
+      if (req.params.id === "devspace-server") {
+        return res.status(409).json({
+          error: "DevSpace Server currently hosts this control plane. Self stop/restart will be enabled after the control plane moves under the standalone Supervisor.",
+        });
+      }
+      if (req.params.id === "cloudflare-tunnel") {
+        await controlScheduledTask("DevSpace Cloudflare Tunnel", action);
+      } else if (req.params.id === "reverse-ssh") {
+        await controlScheduledTask("DevSpace Reverse SSH", action);
+      } else if (req.params.id === "agent-daemon") {
+        if (action === "stop") {
+          const result = await localAgentClient.stop();
+          if (result.isErr()) throw result.error;
+        } else if (action === "start") {
+          const result = await localAgentClient.ensureReady();
+          if (result.isErr()) throw result.error;
+        } else {
+          const stopped = await localAgentClient.stop();
+          if (stopped.isErr() && stopped.error.code !== "DAEMON_UNAVAILABLE") throw stopped.error;
+          const started = await localAgentClient.ensureReady();
+          if (started.isErr()) throw started.error;
+        }
+      } else {
+        return res.status(404).json({ error: "Unknown service." });
+      }
+
+      logEvent(config.logging, "info", "admin_service_control", {
+        service: req.params.id,
+        action,
+      });
+      res.json({ ok: true, services: await resolveAdminServices() });
+    } catch (error) {
+      res.status(500).json({ error: errorMessage(error) });
+    }
+  });
+  app.get("/api/admin/mcp/sessions", (req, res) => {
+    if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
+    res.json({
+      schemaRevision,
+      sessions: transports.list().map((session) => ({
+        ...session,
+        connectedAt: new Date(session.connectedAt).toISOString(),
+        lastActivityAt: new Date(session.lastActivityAt).toISOString(),
+      })),
+    });
+  });
+  app.post("/api/admin/mcp/sessions/disconnect-all", async (req, res) => {
+    if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
+    const results = await transports.closeAll();
+    logSessionCloseResults("admin_disconnect", results);
+    res.json({ ok: true, closed: results.length });
+  });
+  app.post("/api/admin/mcp/sessions/:id/disconnect", async (req, res) => {
+    if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
+    const result = await transports.close(req.params.id);
+    if (!result) return res.status(404).json({ error: "Unknown MCP session." });
+    logSessionCloseResults("admin_disconnect", [result]);
+    if (result.error) return res.status(500).json({ error: errorMessage(result.error) });
+    res.json({ ok: true });
+  });
+  app.post("/api/admin/mcp/reload", async (req, res) => {
+    if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
+    schemaRevision += 1;
+    const results = await transports.closeAll();
+    logSessionCloseResults("schema_reload", results);
+    res.json({ ok: true, schemaRevision, closed: results.length });
+  });
+  app.post("/api/admin/settings", (req, res) => {
+    if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
+    try {
+      const previousSchema = JSON.stringify({
+        toolMode: config.toolMode,
+        widgets: config.widgets,
+        disabledTools: config.disabledTools,
+        skillsEnabled: config.skillsEnabled,
+        subagentsEnabled: config.subagents.enabled,
+        artifactsEnabled: config.artifactsEnabled,
+      });
+      applyAdminSettings(config, req.body);
+      const configPath = persistAdminSettings(config);
+      const nextSchema = JSON.stringify({
+        toolMode: config.toolMode,
+        widgets: config.widgets,
+        disabledTools: config.disabledTools,
+        skillsEnabled: config.skillsEnabled,
+        subagentsEnabled: config.subagents.enabled,
+        artifactsEnabled: config.artifactsEnabled,
+      });
+      if (previousSchema !== nextSchema) schemaRevision += 1;
+      logEvent(config.logging, "info", "admin_settings_updated", {
+        configPath,
+        schemaRevision,
+      });
+      res.json({ ok: true, configPath, schemaRevision, reconnectRecommended: previousSchema !== nextSchema });
+    } catch (error) {
+      res.status(400).json({ error: errorMessage(error) });
+    }
+  });
+  app.get("/api/admin/logs", async (req, res) => {
+    if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
+    const source = typeof req.query.source === "string" ? req.query.source : "server";
+    const lines = Number(req.query.lines ?? 250);
+    try {
+      if (source === "agent") {
+        const result = await localAgentClient.logs(Number.isFinite(lines) ? lines : 250);
+        if (result.isErr()) throw result.error;
+        return res.json({ source, lines: result.value.split(/\r?\n/).filter(Boolean) });
+      }
+      if (source !== "server" && source !== "tunnel") {
+        return res.status(400).json({ error: "Unknown log source." });
+      }
+      res.json({ source, lines: await readAdminLog(source, Number.isFinite(lines) ? lines : 250) });
+    } catch (error) {
+      res.status(500).json({ error: errorMessage(error) });
+    }
   });
   app.get("/api/admin/projects", async (req, res) => {
     if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
     try { res.json({ projects: await discoverProjects(config) }); }
-    catch (error) { res.status(500).json({ error: error instanceof Error ? error.message : String(error) }); }
+    catch (error) { res.status(500).json({ error: errorMessage(error) }); }
   });
-  app.post("/api/admin/open-folder", express.json(), async (req, res) => {
+  app.post("/api/admin/open-folder", async (req, res) => {
     if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
     const target = typeof req.body?.path === "string" ? req.body.path : "";
     const projects = await discoverProjects(config);
@@ -1959,7 +2298,10 @@ export function createServer(
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
-            if (transport) transports.register(newSessionId, transport);
+            if (transport) transports.register(newSessionId, transport, {
+              client: req.header("user-agent") ?? "MCP client",
+              schemaRevision,
+            });
             logEvent(config.logging, "info", "mcp_session_created", {
               requestId,
               sessionIdPrefix: sessionIdPrefix(newSessionId),

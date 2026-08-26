@@ -16,6 +16,11 @@ export interface DevspaceUserConfig {
   allowedRoots?: string[];
   publicBaseUrl?: string | null;
   allowedHosts?: string[];
+  toolMode?: "minimal" | "full" | "codex";
+  widgets?: "off" | "changes" | "full";
+  disabledTools?: string[];
+  skillsEnabled?: boolean;
+  skillPaths?: string[];
   stateDir?: string;
   worktreeRoot?: string;
   artifactsEnabled?: boolean;

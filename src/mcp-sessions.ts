@@ -7,9 +7,22 @@ export interface McpSessionCloseResult {
   error?: unknown;
 }
 
+export interface McpSessionMetadata {
+  client?: string;
+  schemaRevision?: number;
+}
+
+export interface McpSessionSnapshot extends McpSessionMetadata {
+  sessionId: string;
+  connectedAt: number;
+  lastActivityAt: number;
+}
+
 interface McpSessionEntry<TTransport> {
   transport: TTransport;
+  connectedAt: number;
   lastActivityAt: number;
+  metadata: McpSessionMetadata;
 }
 
 export interface McpSessionRegistryOptions {
@@ -28,11 +41,31 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return this.sessions.size;
   }
 
-  register(sessionId: string, transport: TTransport): void {
+  register(sessionId: string, transport: TTransport, metadata: McpSessionMetadata = {}): void {
+    const now = this.now();
     this.sessions.set(sessionId, {
       transport,
-      lastActivityAt: this.now(),
+      connectedAt: now,
+      lastActivityAt: now,
+      metadata,
     });
+  }
+
+  list(): McpSessionSnapshot[] {
+    return Array.from(this.sessions, ([sessionId, entry]) => ({
+      sessionId,
+      connectedAt: entry.connectedAt,
+      lastActivityAt: entry.lastActivityAt,
+      ...entry.metadata,
+    }));
+  }
+
+  async close(sessionId: string): Promise<McpSessionCloseResult | undefined> {
+    const entry = this.sessions.get(sessionId);
+    if (!entry) return undefined;
+    this.sessions.delete(sessionId);
+    const [result] = await closeSessions([{ sessionId, transport: entry.transport }]);
+    return result;
   }
 
   get(sessionId: string): TTransport | undefined {
