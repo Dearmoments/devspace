@@ -53,7 +53,7 @@ import {
 import { expandHomePath } from "./roots.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 
-type Command = "serve" | "init" | "doctor" | "config" | "agents" | "help" | "version";
+type Command = "serve" | "supervisor" | "init" | "doctor" | "config" | "agents" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=20.12 <27";
 
@@ -67,6 +67,10 @@ async function main(argv: string[]): Promise<void> {
     case "serve":
       await ensureConfigured();
       await serve();
+      return;
+    case "supervisor":
+      await ensureConfigured();
+      await supervise();
       return;
     case "init":
       await runInit({ force: args.includes("--force") });
@@ -91,6 +95,7 @@ async function main(argv: string[]): Promise<void> {
 
 function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
+  if (command === "supervisor") return "supervisor";
   if (command === "init" || command === "doctor" || command === "config" || command === "agents") return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
@@ -319,6 +324,41 @@ async function serve(): Promise<void> {
   process.once("SIGTERM", handleShutdown);
 }
 
+async function supervise(): Promise<void> {
+  const { createSupervisor } = await import("./supervisor.js");
+  const config = loadConfig();
+  const supervisor = createSupervisor(config);
+  const httpServer = supervisor.app.listen(config.port, config.host, () => {
+    console.log(`devspace supervisor listening on http://${config.host}:${config.port}`);
+    console.log(`admin console: http://${config.host}:${config.port}/admin`);
+    console.log(`mcp proxy: http://${config.host}:${config.port}/mcp -> http://127.0.0.1:${supervisor.backendPort}/mcp`);
+    console.log(`public base url: ${config.publicBaseUrl}`);
+  });
+
+  void supervisor.startBackend().then(() => {
+    const backend = supervisor.controller.snapshot();
+    console.log(`devspace backend ready on 127.0.0.1:${supervisor.backendPort} pid=${backend.pid ?? "unknown"}`);
+  }).catch((error) => {
+    console.error("devspace backend failed to start; supervisor remains online", error);
+  });
+
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    await shutdownHttpServer(httpServer, supervisor.close);
+    process.exit(0);
+  };
+  const handleShutdown = () => {
+    void shutdown().catch((error) => {
+      console.error("devspace supervisor shutdown failed", error);
+      process.exit(1);
+    });
+  };
+  process.once("SIGINT", handleShutdown);
+  process.once("SIGTERM", handleShutdown);
+}
+
 async function runDoctor(): Promise<void> {
   const files = loadDevspaceFiles();
   console.log(`Config dir: ${files.dir}`);
@@ -383,7 +423,8 @@ function printHelp(): void {
       "",
       "Usage:",
       "  devspace                 Run first-time setup if needed, then start the server",
-      "  devspace serve           Start the server",
+      "  devspace serve           Start the MCP server directly",
+      "  devspace supervisor      Start the persistent control plane and managed MCP backend",
       "  devspace init            Create or update ~/.devspace/config.json and auth.json",
       "  devspace doctor          Show config, runtime, and native dependency status",
       "  devspace config get      Print persisted config",

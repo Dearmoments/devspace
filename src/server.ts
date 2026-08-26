@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { access, readdir, realpath } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { access, realpath } from "node:fs/promises";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
@@ -24,9 +24,14 @@ import {
   isArtifactDownloadSupportedPlatform,
   registerArtifactTools,
 } from "./artifact-tools.js";
-import { loadConfig, type ServerConfig, type ToolMode, type WidgetMode } from "./config.js";
+import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
 import {
+  adminCoreToolStates,
+  applyAdminSettings,
   controlScheduledTask,
+  discoverProjects,
+  errorMessage,
+  persistAdminSettings,
   readAdminLog,
   scheduledTaskSnapshot,
   type AdminServiceStatus,
@@ -61,9 +66,7 @@ import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { openAiConversationScopeId } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
-import { expandHomePath } from "./roots.js";
 import { formatPathForPrompt } from "./skills.js";
-import { loadDevspaceFiles, writeDevspaceConfig } from "./user-config.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import {
@@ -195,28 +198,8 @@ const toolNames = {
   shell: "bash",
 } as const;
 
-const adminCoreTools = Object.values(toolNames);
-
 function isCoreToolEnabled(config: ServerConfig, tool: string): boolean {
   return !config.disabledTools.includes(tool);
-}
-
-function coreToolModeAvailable(config: ServerConfig, tool: string): boolean {
-  if (config.toolMode === "codex") {
-    return new Set<string>([toolNames.listProjects, toolNames.openWorkspace, toolNames.read]).has(tool);
-  }
-  if (config.toolMode === "minimal") {
-    return !new Set<string>([toolNames.grep, toolNames.glob, toolNames.ls]).has(tool);
-  }
-  return true;
-}
-
-function adminCoreToolStates(config: ServerConfig) {
-  return adminCoreTools.map((name) => ({
-    name,
-    available: coreToolModeAvailable(config, name),
-    enabled: coreToolModeAvailable(config, name) && isCoreToolEnabled(config, name),
-  }));
 }
 
 const workspaceIdDescription =
@@ -545,89 +528,6 @@ function setAssetHeaders(res: Response): void {
 function isLocalAdminRequest(req: Request): boolean {
   const host = (req.hostname ?? "").toLowerCase();
   return host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1";
-}
-
-async function discoverProjects(config: ServerConfig): Promise<Array<{ name: string; path: string; root: string }>> {
-  return (await Promise.all(config.allowedRoots.map(async (root) => {
-    const entries = await readdir(root, { withFileTypes: true });
-    return entries.filter((entry) => entry.isDirectory()).map((entry) => ({
-      name: entry.name, path: join(root, entry.name), root,
-    }));
-  }))).flat().sort((left, right) => left.path.localeCompare(right.path));
-}
-
-function applyAdminSettings(config: ServerConfig, body: unknown): void {
-  if (!body || typeof body !== "object") throw new Error("Settings body must be an object.");
-  const input = body as Record<string, unknown>;
-
-  if (input.allowedRoots !== undefined) {
-    if (!Array.isArray(input.allowedRoots) || input.allowedRoots.length === 0) {
-      throw new Error("allowedRoots must contain at least one path.");
-    }
-    const roots = input.allowedRoots.map((value) => {
-      if (typeof value !== "string" || !value.trim()) throw new Error("Each allowed root must be a non-empty path.");
-      return resolve(expandHomePath(value.trim()));
-    });
-    config.allowedRoots = Array.from(new Set(roots));
-  }
-
-  if (input.toolMode !== undefined) {
-    if (!isToolMode(input.toolMode)) throw new Error("Invalid toolMode.");
-    config.toolMode = input.toolMode;
-  }
-  if (input.widgets !== undefined) {
-    if (!isWidgetMode(input.widgets)) throw new Error("Invalid widgets mode.");
-    config.widgets = input.widgets;
-  }
-  if (input.disabledTools !== undefined) {
-    if (!Array.isArray(input.disabledTools)) throw new Error("disabledTools must be an array.");
-    const tools = input.disabledTools.map((value) => {
-      if (typeof value !== "string" || !adminCoreTools.includes(value as typeof adminCoreTools[number])) {
-        throw new Error(`Unknown core tool: ${String(value)}`);
-      }
-      return value;
-    });
-    config.disabledTools = Array.from(new Set(tools));
-  }
-  if (input.skillsEnabled !== undefined) {
-    if (typeof input.skillsEnabled !== "boolean") throw new Error("skillsEnabled must be boolean.");
-    config.skillsEnabled = input.skillsEnabled;
-  }
-  if (input.artifactsEnabled !== undefined) {
-    if (typeof input.artifactsEnabled !== "boolean") throw new Error("artifactsEnabled must be boolean.");
-    config.artifactsEnabled = input.artifactsEnabled;
-  }
-  if (input.subagentsEnabled !== undefined) {
-    if (typeof input.subagentsEnabled !== "boolean") throw new Error("subagentsEnabled must be boolean.");
-    config.subagents = { ...config.subagents, enabled: input.subagentsEnabled };
-  }
-}
-
-function persistAdminSettings(config: ServerConfig): string {
-  const files = loadDevspaceFiles();
-  return writeDevspaceConfig({
-    ...files.config,
-    allowedRoots: config.allowedRoots,
-    toolMode: config.toolMode,
-    widgets: config.widgets,
-    disabledTools: config.disabledTools,
-    skillsEnabled: config.skillsEnabled,
-    skillPaths: config.skillPaths,
-    artifactsEnabled: config.artifactsEnabled,
-    subagents: config.subagents,
-  });
-}
-
-function isToolMode(value: unknown): value is ToolMode {
-  return value === "minimal" || value === "full" || value === "codex";
-}
-
-function isWidgetMode(value: unknown): value is WidgetMode {
-  return value === "off" || value === "changes" || value === "full";
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 async function assertWorkspaceAppAssets(): Promise<void> {
@@ -1924,7 +1824,10 @@ export function createServer(
     getLocalAgentProviderAvailabilitySnapshot(),
   );
   const localAgentClient = new LocalAgentClient({ stateDir: config.stateDir });
-  let schemaRevision = 1;
+  const requestedSchemaRevision = Number(process.env.DEVSPACE_SCHEMA_REVISION ?? "1");
+  let schemaRevision = Number.isSafeInteger(requestedSchemaRevision) && requestedSchemaRevision > 0
+    ? requestedSchemaRevision
+    : 1;
 
   const resolveAdminServices = async (): Promise<AdminServiceStatus[]> => {
     const [cloudflareTask, reverseSshTask, daemonStatus] = await Promise.all([

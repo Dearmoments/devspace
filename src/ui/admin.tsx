@@ -35,6 +35,13 @@ type AdminStatus = {
     disabledTools: string[];
   };
   providers: Provider[];
+  backendRunning?: boolean;
+  supervisor?: {
+    pid: number;
+    uptimeSeconds: number;
+    port: number;
+    backendPort: number;
+  };
 };
 type AdminService = {
   id: string;
@@ -275,9 +282,9 @@ function App() {
         {item.id === "mcp" && status && <b>{status.sessionCount}</b>}
       </button>)}</nav>
       <div className="side-status">
-        <div><span className="pulse" /><strong>LOCAL ONLINE</strong></div>
-        <p>{status ? `v${status.version} · PID ${status.pid}` : "连接本地控制面…"}</p>
-        <small>Phase 1 · 本机管理</small>
+        <div><span className="pulse" /><strong>SUPERVISOR ONLINE</strong></div>
+        <p>{status ? `v${status.version} · PID ${status.supervisor?.pid ?? status.pid}` : "连接本地控制面…"}</p>
+        <small>{status?.supervisor ? `Control :${status.supervisor.port} · Backend :${status.supervisor.backendPort}` : "本机管理"}</small>
       </div>
     </aside>
 
@@ -286,7 +293,7 @@ function App() {
         <div><span className="crumb">DEVSPACE /</span><strong>{NAV.find((item) => item.id === page)?.label}</strong></div>
         <div className="top-actions">
           <button className="ghost" onClick={() => void refreshAll()}>↻ 刷新</button>
-          <span className="live-pill"><i />LOCAL SERVER ONLINE</span>
+          <span className="live-pill"><i />SUPERVISOR ONLINE</span>
         </div>
       </header>
 
@@ -318,11 +325,11 @@ function App() {
 
 function Overview({ status, services, sessions, onNavigate, onReloadTools, busy }: { status: AdminStatus | null; services: AdminService[]; sessions: Session[]; onNavigate: (page: PageId) => void; onReloadTools: () => void; busy: string | null }) {
   const cards = [
-    { key: "server", icon: "▤", title: "DevSpace Server", state: "running" as ServiceState, value: status ? `PID ${status.pid}` : "—", meta: status ? formatDuration(status.uptimeSeconds) : "加载中", action: () => onNavigate("services") },
-    { key: "mcp", icon: "◎", title: "MCP", state: status ? "running" as ServiceState : "unknown" as ServiceState, value: `${status?.sessionCount ?? sessions.length} sessions`, meta: `Schema rev ${status?.schemaRevision ?? "—"}`, action: () => onNavigate("mcp") },
+    { key: "server", icon: "▤", title: "DevSpace MCP Server", state: services.find((service) => service.id === "devspace-server")?.state ?? "unknown" as ServiceState, value: services.find((service) => service.id === "devspace-server")?.pid ? `PID ${services.find((service) => service.id === "devspace-server")?.pid}` : "Stopped", meta: status?.backendRunning ? formatDuration(status.uptimeSeconds) : "由 Supervisor 管理", action: () => onNavigate("services") },
+    { key: "mcp", icon: "◎", title: "MCP", state: status?.backendRunning ? "running" as ServiceState : status ? "stopped" as ServiceState : "unknown" as ServiceState, value: `${status?.sessionCount ?? sessions.length} sessions`, meta: `Schema rev ${status?.schemaRevision ?? "—"}`, action: () => onNavigate("mcp") },
     { key: "tunnel", icon: "↗", title: "Cloudflare Tunnel", state: services.find((service) => service.id === "cloudflare-tunnel")?.state ?? "unknown" as ServiceState, value: services.find((service) => service.id === "cloudflare-tunnel")?.state === "running" ? "Connected" : "Not connected", meta: status?.publicBaseUrl ?? "—", action: () => onNavigate("network") },
     { key: "agent", icon: "◇", title: "Agent Daemon", state: services.find((service) => service.id === "agent-daemon")?.state ?? "unknown" as ServiceState, value: services.find((service) => service.id === "agent-daemon")?.pid ? `PID ${services.find((service) => service.id === "agent-daemon")?.pid}` : "Idle", meta: status?.settings.subagentsEnabled ? "Subagents enabled" : "Subagents disabled", action: () => onNavigate("services") },
-    { key: "oauth", icon: "⌾", title: "OAuth", state: "running" as ServiceState, value: "Enabled", meta: "Owner-token flow", action: () => onNavigate("network") },
+    { key: "oauth", icon: "⌾", title: "OAuth", state: status?.backendRunning ? "running" as ServiceState : "stopped" as ServiceState, value: status?.backendRunning ? "Enabled" : "Backend stopped", meta: "Owner-token flow", action: () => onNavigate("network") },
     { key: "version", icon: "◈", title: "当前版本", state: "running" as ServiceState, value: status ? `v${status.version}` : "—", meta: "本地构建", action: () => onNavigate("settings") },
   ];
 
@@ -349,11 +356,11 @@ function Overview({ status, services, sessions, onNavigate, onReloadTools, busy 
 
 function Services({ services, busy, onControl, onLogs }: { services: AdminService[]; busy: string | null; onControl: (service: AdminService, action: "start" | "stop" | "restart") => void; onLogs: (id: string) => void }) {
   return <>
-    <SectionHeader eyebrow="SERVICE CONTROL" title="服务" description="查看状态并控制 DevSpace 周边服务。核心 Server 自身的启停将在独立 Supervisor 阶段接管。" actions={<button className="secondary" disabled title="Phase 2：Service Registry">＋ 添加服务 · Phase 2</button>} />
+    <SectionHeader eyebrow="SERVICE CONTROL" title="服务" description="Supervisor 独立承载控制台；DevSpace MCP Server 现在可以真正停止、启动和重启。" actions={<button className="secondary" disabled title="后续 Service Registry">＋ 添加服务 · 后续</button>} />
     <section className="panel table-panel">
       <div className="service-table table-head"><span>服务</span><span>状态</span><span>PID / 端点</span><span>控制</span></div>
       {services.map((service) => <div className="service-table table-row" key={service.id}>
-        <div className="service-name"><span className="service-glyph">{service.id === "cloudflare-tunnel" ? "↗" : service.id === "agent-daemon" ? "◇" : service.id === "reverse-ssh" ? "⇄" : "▤"}</span><div><strong>{service.name}</strong><small>{service.description}</small>{service.note && <em>{service.note}</em>}</div></div>
+        <div className="service-name"><span className="service-glyph">{service.id === "supervisor" ? "◉" : service.id === "cloudflare-tunnel" ? "↗" : service.id === "agent-daemon" ? "◇" : service.id === "reverse-ssh" ? "⇄" : "▤"}</span><div><strong>{service.name}</strong><small>{service.description}</small>{service.note && <em>{service.note}</em>}</div></div>
         <StateBadge state={service.state} />
         <div className="endpoint"><strong>{service.pid ? `PID ${service.pid}` : service.taskName || "—"}</strong><small>{service.endpoint || "未配置端点"}</small></div>
         <div className="row-actions">
@@ -447,7 +454,7 @@ function Network({ status }: { status: AdminStatus }) {
 
 function Logs({ source, setSource, lines, onRefresh }: { source: "server" | "tunnel" | "agent"; setSource: (value: "server" | "tunnel" | "agent") => void; lines: string[]; onRefresh: () => Promise<void> }) {
   return <>
-    <SectionHeader eyebrow="LIVE OUTPUT" title="日志" description="从实际服务日志读取，页面每 2.5 秒刷新一次。" actions={<><select value={source} onChange={(event) => setSource(event.target.value as typeof source)}><option value="server">DevSpace Server</option><option value="tunnel">Cloudflare Tunnel</option><option value="agent">Agent Daemon</option></select><button className="secondary" onClick={() => void onRefresh()}>↻ 刷新</button></>} />
+    <SectionHeader eyebrow="LIVE OUTPUT" title="日志" description="从实际服务日志读取，页面每 2.5 秒刷新一次。" actions={<><select value={source} onChange={(event) => setSource(event.target.value as typeof source)}><option value="server">Supervisor + MCP Server</option><option value="tunnel">Cloudflare Tunnel</option><option value="agent">Agent Daemon</option></select><button className="secondary" onClick={() => void onRefresh()}>↻ 刷新</button></>} />
     <section className="log-console"><header><span className="console-dot red" /><span className="console-dot amber" /><span className="console-dot green" /><strong>{source}.log</strong><small>{lines.length} lines</small></header><pre>{lines.length > 0 ? lines.join("\n") : "暂无日志。"}</pre></section>
   </>;
 }
@@ -465,9 +472,9 @@ function Settings({ status, roots, setRoots, busy, onSave }: { status: AdminStat
       </section>
       <section className="panel settings-panel"><h2>MCP Tool Mode</h2><p>决定默认工具面。Full 对应当前 9 个核心工具。</p><select value={toolMode} onChange={(event) => setToolMode(event.target.value as ToolMode)}><option value="minimal">minimal · 精简</option><option value="full">full · 完整</option><option value="codex">codex · Codex 兼容</option></select><div className="setting-current"><span>当前运行值</span><strong>{status.settings.toolMode}</strong></div></section>
       <section className="panel settings-panel"><h2>Widget Mode</h2><p>控制 MCP 工具结果是否附带 DevSpace 卡片。</p><select value={widgets} onChange={(event) => setWidgets(event.target.value as WidgetMode)}><option value="full">full · 完整卡片</option><option value="changes">changes · 变更审阅</option><option value="off">off · 关闭</option></select><div className="setting-current"><span>当前运行值</span><strong>{status.settings.widgets}</strong></div></section>
-      <section className="panel settings-panel system-info"><h2>运行信息</h2><dl><div><dt>Version</dt><dd>{status.version}</dd></div><div><dt>PID</dt><dd>{status.pid}</dd></div><div><dt>Port</dt><dd>{status.port}</dd></div><div><dt>Schema</dt><dd>rev {status.schemaRevision}</dd></div><div><dt>Uptime</dt><dd>{formatDuration(status.uptimeSeconds)}</dd></div></dl></section>
+      <section className="panel settings-panel system-info"><h2>运行信息</h2><dl><div><dt>Version</dt><dd>{status.version}</dd></div><div><dt>Supervisor PID</dt><dd>{status.supervisor?.pid ?? "—"}</dd></div><div><dt>MCP PID</dt><dd>{status.pid || "Stopped"}</dd></div><div><dt>Public Port</dt><dd>{status.supervisor?.port ?? status.port}</dd></div><div><dt>Backend Port</dt><dd>{status.supervisor?.backendPort ?? "—"}</dd></div><div><dt>Schema</dt><dd>rev {status.schemaRevision}</dd></div><div><dt>MCP Uptime</dt><dd>{status.backendRunning ? formatDuration(status.uptimeSeconds) : "Stopped"}</dd></div></dl></section>
     </div>
-    <div className="warning-banner"><span>!</span><p><strong>配置生效边界：</strong>Allowed Roots 等运行时配置会立即用于新操作；工具/Widget/Artifact/Subagent 能力变化对已有 MCP Session 不会自动重注册，建议到 MCP 页执行“重新加载工具”。</p></div>
+    <div className="warning-banner"><span>!</span><p><strong>配置生效方式：</strong>Supervisor 会持久化设置；运行时配置发生变化时会自动重启 MCP 子进程。工具 Schema 变化会断开现有 MCP Session，客户端需要重新连接后获取最新 tools/list。</p></div>
   </>;
 }
 
