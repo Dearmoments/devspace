@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildAdminModeTransitionScript,
+  buildRunAsLauncherScript,
   normalizeTaskRunLevel,
 } from "./windows-privileges.js";
 
@@ -27,4 +28,14 @@ test("disabling administrator mode rewrites the task to LeastPrivilege", () => {
   const script = buildAdminModeTransitionScript("DevSpace Server", false);
   assert.match(script, /LeastPrivilege/);
   assert.doesNotMatch(script, /HighestAvailable/);
+});
+
+test("administrator mode launcher requests an interactive RunAs elevation and logs its outcome", () => {
+  const script = buildRunAsLauncherScript("encoded-helper", true);
+  assert.match(script, /-Verb RunAs/);
+  assert.match(script, /-PassThru -Wait/);
+  assert.match(script, /admin-mode-launcher\.log/);
+  assert.match(script, /launcher-start mode=enable/);
+  assert.match(script, /launcher-failed mode=enable/);
+  assert.doesNotMatch(script, /WindowStyle.*Hidden/);
 });

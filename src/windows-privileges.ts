@@ -89,9 +89,9 @@ export async function requestWindowsAdminModeChange(
   const currentPrivilege = await currentWindowsPrivilegeLevel();
   const helperScript = buildAdminModeTransitionScript(taskName, enabled);
   const encodedHelper = encodePowerShell(helperScript);
-  const launcherScript = buildRunAsLauncherScript(encodedHelper);
+  const launcherScript = buildRunAsLauncherScript(encodedHelper, enabled);
 
-  launchDetachedPowerShell(launcherScript);
+  launchInteractivePowerShell(launcherScript);
 
   return {
     ok: true,
@@ -107,11 +107,12 @@ export function buildAdminModeTransitionScript(taskName: string, enabled: boolea
   const mode = enabled ? "enabled" : "disabled";
   return [
     `$ErrorActionPreference = 'Stop'`,
-    `Start-Sleep -Milliseconds 1200`,
     `$taskName = ${powershellLiteral(taskName)}`,
     `$logDir = Join-Path $env:USERPROFILE '.devspace\\logs'`,
     `$logPath = Join-Path $logDir 'admin-mode-transition.log'`,
     `New-Item -ItemType Directory -Path $logDir -Force | Out-Null`,
+    `"$(Get-Date -Format o) helper-start admin-mode ${mode}: task=$taskName runLevel=${runLevel} integrity=high" | Add-Content -LiteralPath $logPath`,
+    `Start-Sleep -Milliseconds 1200`,
     `try {`,
     `  $xmlText = Export-ScheduledTask -TaskName $taskName -ErrorAction Stop`,
     `  [xml]$xml = $xmlText`,
@@ -181,25 +182,38 @@ async function detectCurrentWindowsPrivilege(): Promise<WindowsPrivilegeLevel> {
   }
 }
 
-function buildRunAsLauncherScript(encodedHelper: string): string {
+export function buildRunAsLauncherScript(encodedHelper: string, enabled: boolean): string {
+  const mode = enabled ? "enable" : "disable";
   return [
-    `$arguments = @('-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', ${powershellLiteral(encodedHelper)})`,
-    `Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $arguments`,
-  ].join("; ");
+    `$ErrorActionPreference = 'Stop'`,
+    `$logDir = Join-Path $env:USERPROFILE '.devspace\\logs'`,
+    `$logPath = Join-Path $logDir 'admin-mode-launcher.log'`,
+    `New-Item -ItemType Directory -Path $logDir -Force | Out-Null`,
+    `"$(Get-Date -Format o) launcher-start mode=${mode} session=$([System.Diagnostics.Process]::GetCurrentProcess().SessionId)" | Add-Content -LiteralPath $logPath`,
+    `try {`,
+    `  $powershell = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'`,
+    `  $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', ${powershellLiteral(encodedHelper)})`,
+    `  $process = Start-Process -FilePath $powershell -Verb RunAs -ArgumentList $arguments -PassThru -Wait`,
+    `  "$(Get-Date -Format o) launcher-finished mode=${mode} exitCode=$($process.ExitCode)" | Add-Content -LiteralPath $logPath`,
+    `} catch {`,
+    `  "$(Get-Date -Format o) launcher-failed mode=${mode} error=$($_.Exception.Message)" | Add-Content -LiteralPath $logPath`,
+    `  throw`,
+    `}`,
+  ].join("\r\n");
 }
 
-function launchDetachedPowerShell(script: string): void {
-  const child = spawn("powershell.exe", [
+function launchInteractivePowerShell(script: string): void {
+  const powershell = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
+  const child = spawn(powershell, [
     "-NoProfile",
-    "-NonInteractive",
-    "-WindowStyle",
-    "Hidden",
+    "-ExecutionPolicy",
+    "Bypass",
     "-EncodedCommand",
     encodePowerShell(script),
   ], {
     detached: true,
     stdio: "ignore",
-    windowsHide: true,
+    windowsHide: false,
   });
   child.unref();
 }
