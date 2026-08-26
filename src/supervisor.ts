@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { request as httpRequest } from "node:http";
+import { request as httpRequest, type IncomingHttpHeaders } from "node:http";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
@@ -114,6 +114,7 @@ export class DevSpaceChildController {
           PORT: String(this.backendPort),
           DEVSPACE_SUPERVISOR_CHILD: "1",
           DEVSPACE_SCHEMA_REVISION: String(this.getSchemaRevision()),
+          DEVSPACE_TRUST_PROXY: "1",
         },
         stdio: ["ignore", "inherit", "inherit"],
         windowsHide: true,
@@ -601,7 +602,7 @@ export function createSupervisor(
 }
 
 function proxyToBackend(req: Request, res: Response, backendPort: number): void {
-  const headers = { ...req.headers };
+  const headers = backendProxyHeaders(req.headers, req.socket.remoteAddress);
   for (const header of HOP_BY_HOP_HEADERS) delete headers[header];
   const proxyRequest = httpRequest({
     hostname: "127.0.0.1",
@@ -634,6 +635,30 @@ function proxyToBackend(req: Request, res: Response, backendPort: number): void 
   });
   req.on("aborted", () => proxyRequest.destroy());
   req.pipe(proxyRequest);
+}
+
+export function backendProxyHeaders(
+  incoming: IncomingHttpHeaders,
+  remoteAddress?: string,
+): IncomingHttpHeaders {
+  const headers = { ...incoming };
+  delete headers["x-forwarded-for"];
+
+  const cloudflareIp = firstHeaderValue(incoming["cf-connecting-ip"]);
+  const clientIp = cloudflareIp ?? normalizeRemoteAddress(remoteAddress);
+  if (clientIp) headers["x-forwarded-for"] = clientIp;
+
+  return headers;
+}
+
+function firstHeaderValue(value: string | string[] | undefined): string | undefined {
+  const first = Array.isArray(value) ? value[0] : value?.split(",")[0];
+  return first?.trim() || undefined;
+}
+
+function normalizeRemoteAddress(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  return value.startsWith("::ffff:") ? value.slice("::ffff:".length) : value;
 }
 
 async function backendJson<T>(

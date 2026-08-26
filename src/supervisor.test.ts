@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import type { ChildProcess, spawn as nodeSpawn } from "node:child_process";
-import { DevSpaceChildController } from "./supervisor.js";
+import { backendProxyHeaders, DevSpaceChildController } from "./supervisor.js";
 
 class FakeChild extends EventEmitter {
   pid: number;
@@ -61,6 +61,7 @@ test("supervisor child controller starts, stops, and passes internal runtime set
   assert.equal(spawns[0]?.env.PORT, "8765");
   assert.equal(spawns[0]?.env.DEVSPACE_SUPERVISOR_CHILD, "1");
   assert.equal(spawns[0]?.env.DEVSPACE_SCHEMA_REVISION, "7");
+  assert.equal(spawns[0]?.env.DEVSPACE_TRUST_PROXY, "1");
 
   revision = 8;
   await controller.restart();
@@ -73,6 +74,22 @@ test("supervisor child controller starts, stops, and passes internal runtime set
   assert.equal(children[1]?.killCalls[0], "SIGTERM");
   assert.equal(controller.snapshot().state, "stopped");
   assert.equal(controller.snapshot().pid, undefined);
+});
+
+test("supervisor normalizes forwarded client IP before proxying to the backend", () => {
+  assert.equal(
+    backendProxyHeaders({
+      host: "devspace.example.com",
+      "cf-connecting-ip": "203.0.113.25",
+      "x-forwarded-for": "198.51.100.9, 192.0.2.7",
+    }, "127.0.0.1")["x-forwarded-for"],
+    "203.0.113.25",
+  );
+
+  assert.equal(
+    backendProxyHeaders({ "x-forwarded-for": "198.51.100.9" }, "::ffff:127.0.0.1")["x-forwarded-for"],
+    "127.0.0.1",
+  );
 });
 
 test("unexpected backend exit is restarted while desired state is running", async () => {

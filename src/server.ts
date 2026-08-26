@@ -1915,7 +1915,7 @@ export function createServer(
   sessionCleanupTimer.unref();
 
   if (config.logging.trustProxy) {
-    app.set("trust proxy", true);
+    app.set("trust proxy", 1);
   }
 
   app.use((req, res, next) => {
