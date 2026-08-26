@@ -241,8 +241,7 @@ async function launchInteractivePowerShell(launcherPath: string, enabled: boolea
       "-File",
       launcherPath,
     ], {
-      detached: true,
-      stdio: "ignore",
+      stdio: ["ignore", "pipe", "pipe"],
       windowsHide: false,
     });
   } catch (error) {
@@ -251,13 +250,35 @@ async function launchInteractivePowerShell(launcherPath: string, enabled: boolea
   }
 
   try {
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      stdout = appendLimitedOutput(stdout, chunk);
+    });
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      stderr = appendLimitedOutput(stderr, chunk);
+    });
+
     await new Promise<void>((resolve, reject) => {
       child.once("spawn", resolve);
       child.once("error", reject);
     });
     await appendParentLog(parentLogPath, `parent-launch-spawned id=${launchId} mode=${mode} pid=${child.pid ?? "unknown"}`);
-    child.unref();
-    await waitForLauncherHandshake(join(logDir, "admin-mode-launcher.log"), launchId);
+
+    const earlyExit = new Promise<never>((_, reject) => {
+      child.once("exit", (code, signal) => {
+        reject(new Error([
+          `PowerShell launcher exited before handshake: code=${code ?? "null"} signal=${signal ?? "null"}.`,
+          stdout ? `stdout=${sanitizeProcessOutput(stdout)}` : "",
+          stderr ? `stderr=${sanitizeProcessOutput(stderr)}` : "",
+        ].filter(Boolean).join(" ")));
+      });
+    });
+
+    await Promise.race([
+      waitForLauncherHandshake(join(logDir, "admin-mode-launcher.log"), launchId),
+      earlyExit,
+    ]);
     await appendParentLog(parentLogPath, `parent-launch-ready id=${launchId} mode=${mode}`);
   } catch (error) {
     await appendParentLog(parentLogPath, `parent-launch-failed mode=${mode} error=${errorMessage(error)}`);
@@ -286,6 +307,15 @@ async function appendParentLog(path: string, message: string): Promise<void> {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message.replaceAll("\r", " ").replaceAll("\n", " ") : String(error);
+}
+
+function appendLimitedOutput(current: string, chunk: Buffer | string): string {
+  const next = current + String(chunk);
+  return next.length > 4_096 ? next.slice(-4_096) : next;
+}
+
+function sanitizeProcessOutput(value: string): string {
+  return value.trim().replaceAll("\r", " ").replaceAll("\n", " ").slice(-2_048);
 }
 
 function powershellLiteral(value: string): string {
