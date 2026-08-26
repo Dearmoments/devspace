@@ -1,4 +1,7 @@
 import { execFile, spawn } from "node:child_process";
+import { appendFile, mkdir } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -91,7 +94,7 @@ export async function requestWindowsAdminModeChange(
   const encodedHelper = encodePowerShell(helperScript);
   const launcherScript = buildRunAsLauncherScript(encodedHelper, enabled);
 
-  launchInteractivePowerShell(launcherScript);
+  await launchInteractivePowerShell(launcherScript, enabled);
 
   return {
     ok: true,
@@ -202,20 +205,52 @@ export function buildRunAsLauncherScript(encodedHelper: string, enabled: boolean
   ].join("\r\n");
 }
 
-function launchInteractivePowerShell(script: string): void {
+async function launchInteractivePowerShell(script: string, enabled: boolean): Promise<void> {
+  const mode = enabled ? "enable" : "disable";
+  const logDir = join(homedir(), ".devspace", "logs");
+  const parentLogPath = join(logDir, "admin-mode-parent.log");
   const powershell = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
-  const child = spawn(powershell, [
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-EncodedCommand",
-    encodePowerShell(script),
-  ], {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: false,
-  });
-  child.unref();
+
+  await mkdir(logDir, { recursive: true });
+  await appendParentLog(parentLogPath, `parent-launch-start mode=${mode} executable=${powershell}`);
+
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = spawn(powershell, [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-EncodedCommand",
+      encodePowerShell(script),
+    ], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: false,
+    });
+  } catch (error) {
+    await appendParentLog(parentLogPath, `parent-launch-failed mode=${mode} error=${errorMessage(error)}`);
+    throw error;
+  }
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    await appendParentLog(parentLogPath, `parent-launch-spawned mode=${mode} pid=${child.pid ?? "unknown"}`);
+    child.unref();
+  } catch (error) {
+    await appendParentLog(parentLogPath, `parent-launch-failed mode=${mode} error=${errorMessage(error)}`);
+    throw error;
+  }
+}
+
+async function appendParentLog(path: string, message: string): Promise<void> {
+  await appendFile(path, `${new Date().toISOString()} ${message}\r\n`, "utf8");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message.replaceAll("\r", " ").replaceAll("\n", " ") : String(error);
 }
 
 function encodePowerShell(script: string): string {
