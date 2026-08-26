@@ -31,11 +31,14 @@ test("disabling administrator mode rewrites the task to LeastPrivilege", () => {
 });
 
 test("administrator mode launcher requests an interactive RunAs elevation and logs its outcome", () => {
-  const script = buildRunAsLauncherScript("encoded-helper", true);
+  const script = buildRunAsLauncherScript("C:\\Users\\test\\.devspace\\runtime\\admin-mode\\helper.ps1", true);
   assert.match(script, /-Verb RunAs/);
   assert.match(script, /-PassThru -Wait/);
   assert.match(script, /admin-mode-launcher\.log/);
   assert.match(script, /launcher-start id=test-launch mode=enable/);
   assert.match(script, /launcher-failed id=test-launch mode=enable/);
+  assert.match(script, /-File/);
+  assert.doesNotMatch(script, /EncodedCommand/);
+  assert.doesNotMatch(script, /ExecutionPolicy.*Bypass/);
   assert.doesNotMatch(script, /WindowStyle.*Hidden/);
 });

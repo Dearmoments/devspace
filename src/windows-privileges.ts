@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -91,12 +91,25 @@ export async function requestWindowsAdminModeChange(
   if (process.platform !== "win32") throw new Error("Administrator mode is only available on Windows.");
 
   const currentPrivilege = await currentWindowsPrivilegeLevel();
-  const helperScript = buildAdminModeTransitionScript(taskName, enabled);
-  const encodedHelper = encodePowerShell(helperScript);
   const launchId = randomUUID();
-  const launcherScript = buildRunAsLauncherScript(encodedHelper, enabled, launchId);
+  const runtimeDir = join(homedir(), ".devspace", "runtime", "admin-mode");
+  const helperPath = join(runtimeDir, `helper-${launchId}.ps1`);
+  const launcherPath = join(runtimeDir, `launcher-${launchId}.ps1`);
+  const helperScript = buildAdminModeTransitionScript(taskName, enabled);
+  const launcherScript = buildRunAsLauncherScript(helperPath, enabled, launchId);
 
-  await launchInteractivePowerShell(launcherScript, enabled, launchId);
+  await mkdir(runtimeDir, { recursive: true });
+  await writeFile(helperPath, helperScript, "utf8");
+  await writeFile(launcherPath, launcherScript, "utf8");
+  try {
+    await launchInteractivePowerShell(launcherPath, enabled, launchId);
+  } catch (error) {
+    await Promise.allSettled([
+      rm(helperPath, { force: true }),
+      rm(launcherPath, { force: true }),
+    ]);
+    throw error;
+  }
 
   return {
     ok: true,
@@ -187,43 +200,46 @@ async function detectCurrentWindowsPrivilege(): Promise<WindowsPrivilegeLevel> {
   }
 }
 
-export function buildRunAsLauncherScript(encodedHelper: string, enabled: boolean, launchId = "test-launch"): string {
+export function buildRunAsLauncherScript(helperPath: string, enabled: boolean, launchId = "test-launch"): string {
   const mode = enabled ? "enable" : "disable";
   return [
     `$ErrorActionPreference = 'Stop'`,
     `$logDir = Join-Path $env:USERPROFILE '.devspace\\logs'`,
     `$logPath = Join-Path $logDir 'admin-mode-launcher.log'`,
+    `$helperPath = ${powershellLiteral(helperPath)}`,
     `New-Item -ItemType Directory -Path $logDir -Force | Out-Null`,
     `"$(Get-Date -Format o) launcher-start id=${launchId} mode=${mode} session=$([System.Diagnostics.Process]::GetCurrentProcess().SessionId)" | Add-Content -LiteralPath $logPath`,
     `try {`,
     `  $powershell = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'`,
-    `  $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', ${powershellLiteral(encodedHelper)})`,
+    `  $quotedHelper = '"' + $helperPath + '"'`,
+    `  $arguments = @('-NoProfile', '-File', $quotedHelper)`,
     `  $process = Start-Process -FilePath $powershell -Verb RunAs -ArgumentList $arguments -PassThru -Wait`,
     `  "$(Get-Date -Format o) launcher-finished id=${launchId} mode=${mode} exitCode=$($process.ExitCode)" | Add-Content -LiteralPath $logPath`,
     `} catch {`,
     `  "$(Get-Date -Format o) launcher-failed id=${launchId} mode=${mode} error=$($_.Exception.Message)" | Add-Content -LiteralPath $logPath`,
     `  throw`,
+    `} finally {`,
+    `  Remove-Item -LiteralPath $helperPath -Force -ErrorAction SilentlyContinue`,
+    `  Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue`,
     `}`,
   ].join("\r\n");
 }
 
-async function launchInteractivePowerShell(script: string, enabled: boolean, launchId: string): Promise<void> {
+async function launchInteractivePowerShell(launcherPath: string, enabled: boolean, launchId: string): Promise<void> {
   const mode = enabled ? "enable" : "disable";
   const logDir = join(homedir(), ".devspace", "logs");
   const parentLogPath = join(logDir, "admin-mode-parent.log");
   const powershell = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
 
   await mkdir(logDir, { recursive: true });
-  await appendParentLog(parentLogPath, `parent-launch-start mode=${mode} executable=${powershell}`);
+  await appendParentLog(parentLogPath, `parent-launch-start mode=${mode} executable=${powershell} launcher=${launcherPath}`);
 
   let child: ReturnType<typeof spawn>;
   try {
     child = spawn(powershell, [
       "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-EncodedCommand",
-      encodePowerShell(script),
+      "-File",
+      launcherPath,
     ], {
       detached: true,
       stdio: "ignore",
@@ -270,10 +286,6 @@ async function appendParentLog(path: string, message: string): Promise<void> {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message.replaceAll("\r", " ").replaceAll("\n", " ") : String(error);
-}
-
-function encodePowerShell(script: string): string {
-  return Buffer.from(script, "utf16le").toString("base64");
 }
 
 function powershellLiteral(value: string): string {
