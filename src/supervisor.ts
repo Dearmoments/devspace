@@ -25,6 +25,7 @@ import {
   requestWindowsAdminModeChange,
   windowsAdminModeSnapshot,
 } from "./windows-privileges.js";
+import { CloudflareTunnelMonitor } from "./tunnel-health.js";
 
 const DEVSPACE_VERSION = (
   JSON.parse(
@@ -322,6 +323,7 @@ export interface RunningSupervisor {
 export interface CreateSupervisorOptions {
   backendPort?: number;
   controller?: DevSpaceChildController;
+  tunnelMonitor?: CloudflareTunnelMonitor;
 }
 
 export function createSupervisor(
@@ -337,6 +339,7 @@ export function createSupervisor(
     backendPort,
     getSchemaRevision: () => schemaRevision,
   });
+  const tunnelMonitor = options.tunnelMonitor ?? new CloudflareTunnelMonitor();
   const localAgentClient = new LocalAgentClient({ stateDir: config.stateDir });
 
   const resolveProviders = () => buildLocalAgentProviderStatuses(
@@ -351,6 +354,7 @@ export function createSupervisor(
       localAgentClient.status(),
     ]);
     const backend = controller.snapshot();
+    const tunnelHealth = tunnelMonitor.snapshot();
     const backendState = backend.state === "running"
       ? "running"
       : backend.state === "stopped"
@@ -391,11 +395,16 @@ export function createSupervisor(
         id: "cloudflare-tunnel",
         name: "Cloudflare Tunnel",
         description: "DevSpace 公网 HTTPS 隧道；入口仍指向 Supervisor 的 7676。",
-        state: cloudflareTask.state,
+        state: cloudflareTask.state === "running"
+          ? tunnelHealth.taskState === "running" && tunnelHealth.healthy
+            ? "running"
+            : "unknown"
+          : cloudflareTask.state,
         taskName: cloudflareTask.taskName,
         endpoint: config.publicBaseUrl,
         controllable: cloudflareTask.state !== "unavailable",
         actions: ["start", "stop", "restart", "logs"],
+        note: cloudflareTask.state === "running" ? tunnelHealth.detail : undefined,
       },
       {
         id: "agent-daemon",
@@ -523,6 +532,7 @@ export function createSupervisor(
         else await controller.restart();
       } else if (req.params.id === "cloudflare-tunnel") {
         await controlScheduledTask("DevSpace Cloudflare Tunnel", action);
+        await tunnelMonitor.checkNow();
       } else if (req.params.id === "reverse-ssh") {
         await controlScheduledTask("DevSpace Reverse SSH", action);
       } else if (req.params.id === "agent-daemon") {
@@ -664,12 +674,15 @@ export function createSupervisor(
 
   app.get("/healthz", (_req, res) => {
     const backend = controller.snapshot();
+    const tunnel = tunnelMonitor.snapshot();
     res.json({
       ok: true,
       name: "devspace-supervisor",
       version: DEVSPACE_VERSION,
       backend: backend.state,
       backendPid: backend.pid,
+      tunnel: tunnel.healthy ? "connected" : tunnel.taskState,
+      tunnelHaConnections: tunnel.haConnections,
     });
   });
 
@@ -682,8 +695,14 @@ export function createSupervisor(
     config,
     backendPort,
     controller,
-    startBackend: () => controller.start(),
-    close: () => controller.shutdown(),
+    startBackend: async () => {
+      tunnelMonitor.start();
+      await controller.start();
+    },
+    close: async () => {
+      tunnelMonitor.stop();
+      await controller.shutdown();
+    },
   };
 }
 
@@ -773,12 +792,30 @@ async function tryBackendJson<T>(backendPort: number, path: string): Promise<T |
   }
 }
 
-async function defaultBackendHealthCheck(backendPort: number): Promise<boolean> {
+export async function defaultBackendHealthCheck(backendPort: number): Promise<boolean> {
   try {
-    const response = await fetch(`http://127.0.0.1:${backendPort}/healthz`, {
-      signal: AbortSignal.timeout(500),
-    });
-    return response.ok;
+    const baseUrl = `http://127.0.0.1:${backendPort}`;
+    const [healthResponse, sessionsResponse, mcpResponse] = await Promise.all([
+      fetch(`${baseUrl}/healthz`, { signal: AbortSignal.timeout(1_500) }),
+      fetch(`${baseUrl}/api/admin/mcp/sessions`, { signal: AbortSignal.timeout(1_500) }),
+      fetch(`${baseUrl}/mcp`, {
+        headers: { Accept: "application/json, text/event-stream" },
+        signal: AbortSignal.timeout(1_500),
+      }),
+    ]);
+    const [health, sessions, mcp] = await Promise.all([
+      healthResponse.json().catch(() => undefined) as Promise<{ ok?: unknown; name?: unknown } | undefined>,
+      sessionsResponse.json().catch(() => undefined) as Promise<{ schemaRevision?: unknown; sessions?: unknown } | undefined>,
+      mcpResponse.json().catch(() => undefined) as Promise<{ error?: unknown } | undefined>,
+    ]);
+    return healthResponse.ok
+      && health?.ok === true
+      && health.name === "devspace"
+      && sessionsResponse.ok
+      && typeof sessions?.schemaRevision === "number"
+      && Array.isArray(sessions.sessions)
+      && (mcpResponse.status === 400 || mcpResponse.status === 401)
+      && mcp?.error !== undefined;
   } catch {
     return false;
   }

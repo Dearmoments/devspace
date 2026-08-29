@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { createServer } from "node:http";
 import test from "node:test";
 import type { ChildProcess, spawn as nodeSpawn } from "node:child_process";
-import { backendProxyHeaders, DevSpaceChildController } from "./supervisor.js";
+import { backendProxyHeaders, defaultBackendHealthCheck, DevSpaceChildController } from "./supervisor.js";
+import {
+  CloudflareTunnelMonitor,
+  findCloudflaredHaConnections,
+  parseCloudflaredHaConnections,
+} from "./tunnel-health.js";
 
 class FakeChild extends EventEmitter {
   pid: number;
@@ -201,6 +207,81 @@ test("a stale child exit event does not overwrite the replacement backend state"
   assert.equal(controller.snapshot().pid, 401);
 
   await controller.shutdown();
+});
+
+test("backend health check rejects a healthz-only backend when the MCP route is unavailable", async () => {
+  const server = createServer((request, response) => {
+    if (request.url === "/healthz") {
+      response.setHeader("content-type", "application/json");
+      response.end('{"ok":true,"name":"devspace"}');
+      return;
+    }
+    response.statusCode = 404;
+    response.end("not found");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert(address && typeof address === "object");
+
+  try {
+    assert.equal(await defaultBackendHealthCheck(address.port), false);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("cloudflared metrics parser reads the active edge connection count", () => {
+  assert.equal(parseCloudflaredHaConnections([
+    "# HELP cloudflared_tunnel_ha_connections Number of active ha connections",
+    "# TYPE cloudflared_tunnel_ha_connections gauge",
+    "cloudflared_tunnel_ha_connections 4",
+  ].join("\n")), 4);
+  assert.equal(parseCloudflaredHaConnections("cloudflared_tunnel_ha_connections 0\n"), 0);
+  assert.equal(parseCloudflaredHaConnections("build_info 1\n"), undefined);
+});
+
+test("cloudflared metrics lookup falls back across the default port range", async () => {
+  const requested: string[] = [];
+  const result = await findCloudflaredHaConnections([
+    "http://127.0.0.1:20241/metrics",
+    "http://127.0.0.1:20242/metrics",
+  ], async (input) => {
+    const url = String(input);
+    requested.push(url);
+    if (url.includes(":20241/")) throw new Error("connection refused");
+    return new Response("cloudflared_tunnel_ha_connections 2\n", { status: 200 });
+  });
+
+  assert.equal(result.haConnections, 2);
+  assert.equal(result.metricsUrl, "http://127.0.0.1:20242/metrics");
+  assert.deepEqual(requested.sort(), [
+    "http://127.0.0.1:20241/metrics",
+    "http://127.0.0.1:20242/metrics",
+  ]);
+});
+
+test("tunnel monitor restarts a running task after repeated zero edge connections", async () => {
+  let restarts = 0;
+  const monitor = new CloudflareTunnelMonitor({
+    probe: async () => ({
+      taskState: "running",
+      healthy: false,
+      restartEligible: true,
+      haConnections: 0,
+      detail: "Cloudflare edge connections: 0",
+    }),
+    restart: async () => { restarts += 1; },
+    failureThreshold: 3,
+    intervalMs: 60_000,
+  });
+
+  await monitor.checkNow();
+  await monitor.checkNow();
+  assert.equal(restarts, 0);
+  await monitor.checkNow();
+  assert.equal(restarts, 1);
+  assert.equal(monitor.snapshot().haConnections, 0);
+  monitor.stop();
 });
 
 function delay(ms: number): Promise<void> {
