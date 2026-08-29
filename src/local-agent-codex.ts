@@ -458,6 +458,7 @@ function threadParams(input: LocalAgentRunInput): Record<string, unknown> {
     approvalPolicy: "never",
     sandbox: sandboxFor(input.writeMode),
     ...(input.model ? { model: input.model } : {}),
+    ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
   };
 }
 
@@ -468,6 +469,7 @@ function turnParams(input: LocalAgentRunInput, threadId: string): Record<string,
     approvalPolicy: "never",
     sandboxPolicy: sandboxPolicyFor(input.writeMode),
     ...(input.model ? { model: input.model } : {}),
+    ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
     ...(input.effort ? { effort: input.effort } : {}),
   };
 }

@@ -33,6 +33,7 @@ import { LocalAgentRuntimePool } from "./local-agent-runtime-pool.js";
 import { assertAllowedPath } from "./roots.js";
 import {
   isSubagentProviderEnabled,
+  subagentProviderConfig,
   type SubagentsConfig,
 } from "./local-agent-config.js";
 
@@ -316,6 +317,7 @@ export class LocalAgentManager {
         writeMode: input.value.writeMode,
         model: input.value.model,
         effort: input.value.effort,
+        serviceTier: input.value.serviceTier,
         agentDir: this.agentDir,
       };
       const callbacks: LocalAgentRunCallbacks = {
@@ -425,6 +427,9 @@ export class LocalAgentManager {
       writeMode: overrides.writeMode ?? "allowed",
       model: record.model ?? profile?.model,
       effort: record.effort ?? profile?.effort,
+      serviceTier: isLocalAgentProvider(record.provider)
+        ? subagentProviderConfig(this.subagents, record.provider)?.serviceTier
+        : undefined,
       modelOverrideRequested: overrides.model !== undefined,
       effortOverrideRequested: overrides.effort !== undefined,
     });

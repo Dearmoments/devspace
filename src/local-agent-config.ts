@@ -9,6 +9,7 @@ const providerSchema = z.object({
   enabled: z.boolean(),
   model: z.string().trim().min(1).optional(),
   effort: z.string().trim().min(1).optional(),
+  serviceTier: z.string().trim().min(1).optional(),
 }).strict();
 
 const subagentsSchema = z.object({

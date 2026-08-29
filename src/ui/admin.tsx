@@ -11,7 +11,7 @@ type TaskRunLevel = "highest" | "limited" | "unknown" | "missing" | "unsupported
 
 type Project = { name: string; path: string; root: string };
 type ToolState = { name: string; available: boolean; enabled: boolean };
-type Provider = { id?: string; name?: string; available?: boolean; enabled?: boolean; usable?: boolean; note?: string; model?: string; effort?: string };
+type Provider = { id?: string; name?: string; available?: boolean; enabled?: boolean; usable?: boolean; note?: string; model?: string; effort?: string; serviceTier?: string };
 type AdminStatus = {
   ok: boolean;
   name: string;
@@ -411,14 +411,14 @@ function Services({ services, busy, onControl, onLogs }: { services: AdminServic
 
 function Plugins({ status, busy, onToggleTool, onSave }: { status: AdminStatus; busy: string | null; onToggleTool: (name: string, enabled: boolean) => Promise<void>; onSave: (patch: Record<string, unknown>, success?: string) => Promise<void> }) {
   const [subagentSettingsOpen, setSubagentSettingsOpen] = useState(false);
-  const providerSignature = JSON.stringify(status.providers.map((provider) => ({ id: provider.id, enabled: provider.enabled, model: provider.model, effort: provider.effort })));
-  const [providerDrafts, setProviderDrafts] = useState<Record<string, { model: string; effort: string }>>({});
+  const providerSignature = JSON.stringify(status.providers.map((provider) => ({ id: provider.id, enabled: provider.enabled, model: provider.model, effort: provider.effort, serviceTier: provider.serviceTier })));
+  const [providerDrafts, setProviderDrafts] = useState<Record<string, { model: string; effort: string; serviceTier: string }>>({});
 
   useEffect(() => {
-    const next: Record<string, { model: string; effort: string }> = {};
+    const next: Record<string, { model: string; effort: string; serviceTier: string }> = {};
     for (const provider of status.providers) {
       if (!provider.id || provider.enabled !== true) continue;
-      next[provider.id] = { model: provider.model ?? "", effort: provider.effort ?? "" };
+      next[provider.id] = { model: provider.model ?? "", effort: provider.effort ?? "", serviceTier: provider.serviceTier ?? "" };
     }
     setProviderDrafts(next);
   }, [providerSignature]);
@@ -427,12 +427,13 @@ function Plugins({ status, busy, onToggleTool, onSave }: { status: AdminStatus; 
   const saveSubagentDefaults = async () => {
     await onSave({
       subagentProviders: configuredProviders.map((provider) => {
-        const draft = providerDrafts[provider.id!] ?? { model: provider.model ?? "", effort: provider.effort ?? "" };
+        const draft = providerDrafts[provider.id!] ?? { model: provider.model ?? "", effort: provider.effort ?? "", serviceTier: provider.serviceTier ?? "" };
         return {
           id: provider.id,
           enabled: true,
           ...(draft.model.trim() ? { model: draft.model.trim() } : {}),
           ...(draft.effort.trim() ? { effort: draft.effort.trim() } : {}),
+          ...(draft.serviceTier.trim() ? { serviceTier: draft.serviceTier.trim() } : {}),
         };
       }),
     }, "Subagent 默认模型与思考强度已保存");
@@ -461,7 +462,7 @@ function Plugins({ status, busy, onToggleTool, onSave }: { status: AdminStatus; 
           {configuredProviders.length === 0 && <div className="subagent-empty">当前没有启用的 Provider。先在配置中启用一个 Provider。</div>}
           {configuredProviders.map((provider) => {
             const id = provider.id!;
-            const draft = providerDrafts[id] ?? { model: provider.model ?? "", effort: provider.effort ?? "" };
+            const draft = providerDrafts[id] ?? { model: provider.model ?? "", effort: provider.effort ?? "", serviceTier: provider.serviceTier ?? "" };
             const standardEfforts = ["minimal", "low", "medium", "high", "xhigh", "max"];
             return <div className="subagent-provider-editor" key={id}>
               <div className="subagent-provider-title"><strong>{id}</strong><span>{provider.available ? "Available" : "Unavailable"}</span></div>
@@ -471,6 +472,10 @@ function Plugins({ status, busy, onToggleTool, onSave }: { status: AdminStatus; 
                 {draft.effort && !standardEfforts.includes(draft.effort) && <option value={draft.effort}>{draft.effort}</option>}
                 {standardEfforts.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
               </select></label>
+              {id === "codex" && <label><span>处理速度</span><select value={draft.serviceTier} onChange={(event) => setProviderDrafts((current) => ({ ...current, [id]: { ...draft, serviceTier: event.target.value } }))}>
+                <option value="">默认</option>
+                <option value="fast">Fast</option>
+              </select></label>}
             </div>;
           })}
           <div className="subagent-settings-actions"><span>保存后会自动重启 DevSpace 后端，让新默认值生效。</span><button className="primary" disabled={busy !== null || configuredProviders.length === 0} onClick={() => void saveSubagentDefaults()}>保存设置</button></div>

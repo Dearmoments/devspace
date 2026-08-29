@@ -11,6 +11,7 @@ export interface LocalAgentRunInput {
   writeMode?: LocalAgentWriteMode;
   model?: string;
   effort?: string;
+  serviceTier?: string;
   modelOverrideRequested?: boolean;
   effortOverrideRequested?: boolean;
 }
@@ -39,6 +40,7 @@ export interface LocalAgentRuntimeContext {
   writeMode?: LocalAgentWriteMode;
   model?: string;
   effort?: string;
+  serviceTier?: string;
   agentDir?: string;
 }
 

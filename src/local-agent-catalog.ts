@@ -14,6 +14,7 @@ export interface LocalAgentProviderStatus {
   usable: boolean;
   model?: string;
   effort?: string;
+  serviceTier?: string;
   reason?: string;
   note?: string;
 }
@@ -40,6 +41,7 @@ export function buildLocalAgentProviderStatuses(
       usable: config.enabled && enabled && available,
       model: configured?.model,
       effort: configured?.effort,
+      ...(configured?.serviceTier ? { serviceTier: configured.serviceTier } : {}),
       reason: live?.reason,
       note: live?.note,
     };
