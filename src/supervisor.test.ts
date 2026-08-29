@@ -9,6 +9,7 @@ class FakeChild extends EventEmitter {
   exitCode: number | null = null;
   signalCode: NodeJS.Signals | null = null;
   killCalls: Array<NodeJS.Signals | number | undefined> = [];
+  deferExitEventOnKill = false;
 
   constructor(pid: number) {
     super();
@@ -20,8 +21,14 @@ class FakeChild extends EventEmitter {
     if (this.exitCode !== null) return false;
     this.exitCode = 0;
     this.signalCode = typeof signal === "string" ? signal : null;
-    queueMicrotask(() => this.emit("exit", this.exitCode, this.signalCode));
+    if (!this.deferExitEventOnKill) {
+      queueMicrotask(() => this.emit("exit", this.exitCode, this.signalCode));
+    }
     return true;
+  }
+
+  emitDeferredExit(): void {
+    this.emit("exit", this.exitCode, this.signalCode);
   }
 
   crash(code = 1): void {
@@ -159,6 +166,39 @@ test("unhealthy backend is restarted even when the child process is still runnin
   assert.equal(children.length, 2);
   assert.equal(controller.snapshot().state, "running");
   assert.equal(controller.snapshot().pid, 301);
+
+  await controller.shutdown();
+});
+
+test("a stale child exit event does not overwrite the replacement backend state", async () => {
+  let nextPid = 400;
+  const children: FakeChild[] = [];
+  const spawnProcess = (() => {
+    const child = new FakeChild(nextPid++);
+    if (children.length === 0) child.deferExitEventOnKill = true;
+    children.push(child);
+    return child as unknown as ChildProcess;
+  }) as unknown as typeof nodeSpawn;
+
+  const controller = new DevSpaceChildController({
+    backendPort: 8768,
+    getSchemaRevision: () => 5,
+    cliPath: "C:/devspace/dist/cli.js",
+    spawnProcess,
+    healthCheck: async () => true,
+    restartDelayMs: 1,
+    healthCheckIntervalMs: 5,
+  });
+
+  await controller.start();
+  await controller.restart();
+  assert.equal(controller.snapshot().state, "running");
+  assert.equal(controller.snapshot().pid, 401);
+
+  children[0]?.emitDeferredExit();
+
+  assert.equal(controller.snapshot().state, "running");
+  assert.equal(controller.snapshot().pid, 401);
 
   await controller.shutdown();
 });

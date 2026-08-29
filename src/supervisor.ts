@@ -222,9 +222,10 @@ export class DevSpaceChildController {
 
   private attachExitHandler(child: ChildProcess): void {
     child.once("exit", (code, signal) => {
+      if (this.child !== child) return;
       this.lastExitCode = code;
       this.lastExitSignal = signal;
-      if (this.child === child) this.child = undefined;
+      this.child = undefined;
       this.clearHealthCheckTimer();
       this.consecutiveHealthCheckFailures = 0;
       this.state = "stopped";
