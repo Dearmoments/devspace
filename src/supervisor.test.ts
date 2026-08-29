@@ -125,6 +125,52 @@ test("unexpected backend exit is restarted while desired state is running", asyn
   assert.equal(children.length, 2, "shutdown must not schedule another automatic restart");
 });
 
+test("unhealthy backend is restarted even when the child process is still running", async () => {
+  let nextPid = 300;
+  let healthy = true;
+  const children: FakeChild[] = [];
+  const spawnProcess = (() => {
+    const child = new FakeChild(nextPid++);
+    children.push(child);
+    return child as unknown as ChildProcess;
+  }) as unknown as typeof nodeSpawn;
+
+  const controller = new DevSpaceChildController({
+    backendPort: 8767,
+    getSchemaRevision: () => 4,
+    cliPath: "C:/devspace/dist/cli.js",
+    spawnProcess,
+    healthCheck: async () => healthy,
+    restartDelayMs: 1,
+    healthCheckIntervalMs: 5,
+    healthCheckFailureThreshold: 2,
+  });
+
+  await controller.start();
+  healthy = false;
+  await waitFor(() => children[0]?.killCalls.length === 1, "unhealthy backend termination");
+  healthy = true;
+  await waitFor(
+    () => controller.snapshot().state === "running" && controller.snapshot().pid === 301,
+    "replacement backend startup",
+  );
+
+  assert.equal(children[0]?.killCalls[0], "SIGTERM");
+  assert.equal(children.length, 2);
+  assert.equal(controller.snapshot().state, "running");
+  assert.equal(controller.snapshot().pid, 301);
+
+  await controller.shutdown();
+});
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitFor(condition: () => boolean, description: string, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${description}`);
+    await delay(10);
+  }
 }

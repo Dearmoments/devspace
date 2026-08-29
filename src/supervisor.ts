@@ -33,6 +33,8 @@ const DEVSPACE_VERSION = (
 ).version;
 const DEFAULT_BACKEND_START_TIMEOUT_MS = 10_000;
 const DEFAULT_BACKEND_RESTART_DELAY_MS = 1_000;
+const DEFAULT_BACKEND_HEALTH_CHECK_INTERVAL_MS = 10_000;
+const DEFAULT_BACKEND_HEALTH_CHECK_FAILURE_THRESHOLD = 3;
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
   "keep-alive",
@@ -61,6 +63,8 @@ export interface DevSpaceChildControllerOptions {
   env?: NodeJS.ProcessEnv;
   startTimeoutMs?: number;
   restartDelayMs?: number;
+  healthCheckIntervalMs?: number;
+  healthCheckFailureThreshold?: number;
   spawnProcess?: typeof spawn;
   healthCheck?: (backendPort: number) => Promise<boolean>;
 }
@@ -72,6 +76,8 @@ export class DevSpaceChildController {
   private readonly env: NodeJS.ProcessEnv;
   private readonly startTimeoutMs: number;
   private readonly restartDelayMs: number;
+  private readonly healthCheckIntervalMs: number;
+  private readonly healthCheckFailureThreshold: number;
   private readonly spawnProcess: typeof spawn;
   private readonly healthCheck: (backendPort: number) => Promise<boolean>;
   private child?: ChildProcess;
@@ -82,6 +88,8 @@ export class DevSpaceChildController {
   private lastExitCode?: number | null;
   private lastExitSignal?: NodeJS.Signals | null;
   private restartTimer?: NodeJS.Timeout;
+  private healthCheckTimer?: NodeJS.Timeout;
+  private consecutiveHealthCheckFailures = 0;
   private operation?: Promise<void>;
 
   constructor(options: DevSpaceChildControllerOptions) {
@@ -91,6 +99,9 @@ export class DevSpaceChildController {
     this.env = options.env ?? process.env;
     this.startTimeoutMs = options.startTimeoutMs ?? DEFAULT_BACKEND_START_TIMEOUT_MS;
     this.restartDelayMs = options.restartDelayMs ?? DEFAULT_BACKEND_RESTART_DELAY_MS;
+    this.healthCheckIntervalMs = options.healthCheckIntervalMs ?? DEFAULT_BACKEND_HEALTH_CHECK_INTERVAL_MS;
+    this.healthCheckFailureThreshold = options.healthCheckFailureThreshold
+      ?? DEFAULT_BACKEND_HEALTH_CHECK_FAILURE_THRESHOLD;
     this.spawnProcess = options.spawnProcess ?? spawn;
     this.healthCheck = options.healthCheck ?? defaultBackendHealthCheck;
   }
@@ -134,6 +145,8 @@ export class DevSpaceChildController {
           throw new Error("DevSpace MCP backend exited during startup.");
         }
         this.state = "running";
+        this.consecutiveHealthCheckFailures = 0;
+        this.scheduleHealthCheck(child);
       } catch (error) {
         if (this.child === child && child.exitCode === null) child.kill("SIGTERM");
         this.state = "stopped";
@@ -145,6 +158,8 @@ export class DevSpaceChildController {
   async stop(): Promise<void> {
     this.desiredRunning = false;
     this.clearRestartTimer();
+    this.clearHealthCheckTimer();
+    this.consecutiveHealthCheckFailures = 0;
     return this.runExclusive(async () => {
       const child = this.child;
       if (!child || child.exitCode !== null) {
@@ -167,6 +182,8 @@ export class DevSpaceChildController {
   async restart(): Promise<void> {
     this.desiredRunning = true;
     this.clearRestartTimer();
+    this.clearHealthCheckTimer();
+    this.consecutiveHealthCheckFailures = 0;
     await this.runExclusive(async () => {
       const child = this.child;
       if (child && child.exitCode === null) {
@@ -188,6 +205,7 @@ export class DevSpaceChildController {
     this.shuttingDown = true;
     this.desiredRunning = false;
     this.clearRestartTimer();
+    this.clearHealthCheckTimer();
     await this.stop();
   }
 
@@ -207,6 +225,8 @@ export class DevSpaceChildController {
       this.lastExitCode = code;
       this.lastExitSignal = signal;
       if (this.child === child) this.child = undefined;
+      this.clearHealthCheckTimer();
+      this.consecutiveHealthCheckFailures = 0;
       this.state = "stopped";
       if (this.desiredRunning && !this.shuttingDown) this.scheduleRestart();
     });
@@ -228,6 +248,52 @@ export class DevSpaceChildController {
     if (!this.restartTimer) return;
     clearTimeout(this.restartTimer);
     this.restartTimer = undefined;
+  }
+
+  private scheduleHealthCheck(child: ChildProcess): void {
+    this.clearHealthCheckTimer();
+    if (!this.desiredRunning || this.shuttingDown || this.child !== child || this.state !== "running") return;
+    this.healthCheckTimer = setTimeout(() => {
+      this.healthCheckTimer = undefined;
+      void this.runHealthCheck(child);
+    }, this.healthCheckIntervalMs);
+    this.healthCheckTimer.unref();
+  }
+
+  private async runHealthCheck(child: ChildProcess): Promise<void> {
+    let healthy = false;
+    try {
+      healthy = await this.healthCheck(this.backendPort);
+    } catch {
+      healthy = false;
+    }
+    if (!this.desiredRunning || this.shuttingDown || this.child !== child || this.state !== "running") return;
+
+    if (healthy) {
+      this.consecutiveHealthCheckFailures = 0;
+      this.scheduleHealthCheck(child);
+      return;
+    }
+
+    this.consecutiveHealthCheckFailures += 1;
+    if (this.consecutiveHealthCheckFailures < this.healthCheckFailureThreshold) {
+      this.scheduleHealthCheck(child);
+      return;
+    }
+
+    this.consecutiveHealthCheckFailures = 0;
+    console.error(`devspace backend failed ${this.healthCheckFailureThreshold} consecutive health checks; restarting`);
+    try {
+      await this.restart();
+    } catch (error) {
+      console.error("devspace backend health restart failed", error);
+      if (this.desiredRunning && !this.shuttingDown) this.scheduleRestart();
+    }
+  }
+
+  private clearHealthCheckTimer(): void {
+    if (this.healthCheckTimer) clearTimeout(this.healthCheckTimer);
+    this.healthCheckTimer = undefined;
   }
 
   private async waitUntilHealthy(child: ChildProcess): Promise<void> {
