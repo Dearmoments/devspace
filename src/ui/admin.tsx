@@ -11,7 +11,7 @@ type TaskRunLevel = "highest" | "limited" | "unknown" | "missing" | "unsupported
 
 type Project = { name: string; path: string; root: string };
 type ToolState = { name: string; available: boolean; enabled: boolean };
-type Provider = { id?: string; name?: string; available?: boolean; enabled?: boolean; usable?: boolean; note?: string; model?: string };
+type Provider = { id?: string; name?: string; available?: boolean; enabled?: boolean; usable?: boolean; note?: string; model?: string; effort?: string };
 type AdminStatus = {
   ok: boolean;
   name: string;
@@ -410,6 +410,34 @@ function Services({ services, busy, onControl, onLogs }: { services: AdminServic
 }
 
 function Plugins({ status, busy, onToggleTool, onSave }: { status: AdminStatus; busy: string | null; onToggleTool: (name: string, enabled: boolean) => Promise<void>; onSave: (patch: Record<string, unknown>, success?: string) => Promise<void> }) {
+  const [subagentSettingsOpen, setSubagentSettingsOpen] = useState(false);
+  const providerSignature = JSON.stringify(status.providers.map((provider) => ({ id: provider.id, enabled: provider.enabled, model: provider.model, effort: provider.effort })));
+  const [providerDrafts, setProviderDrafts] = useState<Record<string, { model: string; effort: string }>>({});
+
+  useEffect(() => {
+    const next: Record<string, { model: string; effort: string }> = {};
+    for (const provider of status.providers) {
+      if (!provider.id || provider.enabled !== true) continue;
+      next[provider.id] = { model: provider.model ?? "", effort: provider.effort ?? "" };
+    }
+    setProviderDrafts(next);
+  }, [providerSignature]);
+
+  const configuredProviders = status.providers.filter((provider) => provider.id && provider.enabled === true);
+  const saveSubagentDefaults = async () => {
+    await onSave({
+      subagentProviders: configuredProviders.map((provider) => {
+        const draft = providerDrafts[provider.id!] ?? { model: provider.model ?? "", effort: provider.effort ?? "" };
+        return {
+          id: provider.id,
+          enabled: true,
+          ...(draft.model.trim() ? { model: draft.model.trim() } : {}),
+          ...(draft.effort.trim() ? { effort: draft.effort.trim() } : {}),
+        };
+      }),
+    }, "Subagent 默认模型与思考强度已保存");
+  };
+
   const simplePlugins = [
     { id: "widgets", title: "Widgets", version: "built-in", description: "MCP 卡片与交互式结果界面。", enabled: status.settings.widgets !== "off", toggle: (value: boolean) => onSave({ widgets: value ? "full" : "off" }, `Widgets ${value ? "已启用" : "已禁用"}`) },
     { id: "skills", title: "Skills", version: "built-in", description: "发现并加载可调用的本地技能。", enabled: status.settings.skillsEnabled, toggle: (value: boolean) => onSave({ skillsEnabled: value }, `Skills ${value ? "已启用" : "已禁用"}`) },
@@ -425,11 +453,29 @@ function Plugins({ status, busy, onToggleTool, onSave }: { status: AdminStatus; 
         <div className="tool-toggle-grid">{status.tools.map((tool) => <button key={tool.name} disabled={!tool.available || busy !== null} className={tool.enabled ? "on" : "off"} onClick={() => void onToggleTool(tool.name, !tool.enabled)}><span>{tool.enabled ? "●" : "○"}</span>{tool.name}</button>)}</div>
         <footer><span>{status.exposedCoreToolCount} / {status.tools.filter((tool) => tool.available).length} 已启用</span><span>修改后建议重连 MCP</span></footer>
       </article>
-      {simplePlugins.map((plugin) => <article className="plugin-card" key={plugin.id}>
+      {simplePlugins.map((plugin) => <article className={`plugin-card ${plugin.id === "subagents" && subagentSettingsOpen ? "subagent-card-open" : ""}`} key={plugin.id}>
         <div className="plugin-heading"><div className="plugin-icon">{plugin.id === "widgets" ? "▦" : plugin.id === "skills" ? "✦" : plugin.id === "subagents" ? "◇" : "⬡"}</div><div><h3>{plugin.title}</h3><small>{plugin.version}</small></div><Toggle checked={plugin.enabled} disabled={busy !== null} onChange={(value) => void plugin.toggle(value)} label={plugin.title} /></div>
         <p>{plugin.description}</p>
         <div className="plugin-meta"><span>状态</span><strong>{plugin.enabled ? "Enabled" : "Disabled"}</strong></div>
-        <footer><button className="ghost" disabled>设置</button><span>内置模块</span></footer>
+        {plugin.id === "subagents" && subagentSettingsOpen && <div className="subagent-settings">
+          {configuredProviders.length === 0 && <div className="subagent-empty">当前没有启用的 Provider。先在配置中启用一个 Provider。</div>}
+          {configuredProviders.map((provider) => {
+            const id = provider.id!;
+            const draft = providerDrafts[id] ?? { model: provider.model ?? "", effort: provider.effort ?? "" };
+            const standardEfforts = ["minimal", "low", "medium", "high", "xhigh", "max"];
+            return <div className="subagent-provider-editor" key={id}>
+              <div className="subagent-provider-title"><strong>{id}</strong><span>{provider.available ? "Available" : "Unavailable"}</span></div>
+              <label><span>默认模型</span><input value={draft.model} placeholder="例如 gpt-5.6-luna" onChange={(event) => setProviderDrafts((current) => ({ ...current, [id]: { ...draft, model: event.target.value } }))} /></label>
+              <label><span>思考强度</span><select value={draft.effort} onChange={(event) => setProviderDrafts((current) => ({ ...current, [id]: { ...draft, effort: event.target.value } }))}>
+                <option value="">Provider 默认</option>
+                {draft.effort && !standardEfforts.includes(draft.effort) && <option value={draft.effort}>{draft.effort}</option>}
+                {standardEfforts.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
+              </select></label>
+            </div>;
+          })}
+          <div className="subagent-settings-actions"><span>保存后会自动重启 DevSpace 后端，让新默认值生效。</span><button className="primary" disabled={busy !== null || configuredProviders.length === 0} onClick={() => void saveSubagentDefaults()}>保存设置</button></div>
+        </div>}
+        <footer><button className="ghost" disabled={plugin.id !== "subagents" || busy !== null} onClick={() => plugin.id === "subagents" && setSubagentSettingsOpen((open) => !open)}>{plugin.id === "subagents" && subagentSettingsOpen ? "收起" : "设置"}</button><span>内置模块</span></footer>
       </article>)}
       {status.providers.map((provider, index) => {
         const id = provider.id || provider.name || `provider-${index}`;

@@ -850,6 +850,7 @@ function runtimeSettingsFingerprint(config: ServerConfig): string {
   return JSON.stringify({
     schema: schemaSettingsFingerprint(config),
     allowedRoots: config.allowedRoots,
+    subagentProviders: config.subagents.providers,
   });
 }
 

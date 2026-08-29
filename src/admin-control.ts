@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ServerConfig, ToolMode, WidgetMode } from "./config.js";
+import { resolveSubagentsConfig } from "./local-agent-config.js";
 import { expandHomePath } from "./roots.js";
 import { loadDevspaceFiles, writeDevspaceConfig } from "./user-config.js";
 
@@ -105,6 +106,12 @@ export function applyAdminSettings(config: ServerConfig, body: unknown): void {
   if (input.subagentsEnabled !== undefined) {
     if (typeof input.subagentsEnabled !== "boolean") throw new Error("subagentsEnabled must be boolean.");
     config.subagents = { ...config.subagents, enabled: input.subagentsEnabled };
+  }
+  if (input.subagentProviders !== undefined) {
+    config.subagents = resolveSubagentsConfig({
+      enabled: config.subagents.enabled,
+      providers: input.subagentProviders,
+    }, {});
   }
 }
 
