@@ -15,6 +15,8 @@ export class GitWorktreeError extends Error {
       | "GIT_REPOSITORY_NOT_FOUND"
       | "GIT_REPOSITORY_HAS_NO_COMMITS"
       | "GIT_INVALID_BASE_REF"
+      | "GIT_WORKTREE_DIRTY"
+      | "GIT_WORKTREE_REMOVE_FAILED"
       | "GIT_WORKTREE_CREATE_FAILED",
     message: string,
   ) {
@@ -31,6 +33,73 @@ export interface ManagedWorktree {
   dirtySource: boolean;
   detached: boolean;
   managed: boolean;
+}
+
+export async function removeManagedWorktree(input: {
+  worktree: ManagedWorktree;
+  config: ServerConfig;
+}): Promise<void> {
+  if (!input.worktree.managed) return;
+
+  const worktreePath = resolve(input.worktree.path);
+  const sourceRoot = assertAllowedPath(input.worktree.sourceRoot, input.config.allowedRoots);
+  assertAllowedPath(worktreePath, [resolve(input.config.worktreeRoot)]);
+
+  let worktreeStats;
+  try {
+    worktreeStats = await stat(worktreePath);
+  } catch (error) {
+    if (isErrnoCode(error, "ENOENT") || isErrnoCode(error, "ENOTDIR")) return;
+    throw new GitWorktreeError(
+      "GIT_WORKTREE_REMOVE_FAILED",
+      `Cannot inspect the managed worktree before closing it: ${worktreePath}. ${errorMessage(error)}`,
+    );
+  }
+  if (!worktreeStats.isDirectory()) {
+    throw new GitWorktreeError(
+      "GIT_WORKTREE_REMOVE_FAILED",
+      `Managed worktree path is not a directory: ${worktreePath}.`,
+    );
+  }
+
+  let status: string;
+  try {
+    status = await git(["status", "--porcelain=v1", "--untracked-files=all"], worktreePath);
+  } catch (error) {
+    throw new GitWorktreeError(
+      "GIT_WORKTREE_REMOVE_FAILED",
+      `Cannot inspect the managed worktree before closing it: ${worktreePath}. ${errorMessage(error)}`,
+    );
+  }
+  if (status.trim()) {
+    throw new GitWorktreeError(
+      "GIT_WORKTREE_DIRTY",
+      `Managed worktree has uncommitted changes: ${worktreePath}. Commit or discard them before closing the workspace.`,
+    );
+  }
+
+  try {
+    await git(["worktree", "remove", worktreePath], sourceRoot);
+  } catch (error) {
+    throw new GitWorktreeError(
+      "GIT_WORKTREE_REMOVE_FAILED",
+      `Git failed to remove the managed worktree. ${errorMessage(error)}`,
+    );
+  }
+
+  try {
+    await stat(worktreePath);
+  } catch (error) {
+    if (isErrnoCode(error, "ENOENT") || isErrnoCode(error, "ENOTDIR")) return;
+    throw new GitWorktreeError(
+      "GIT_WORKTREE_REMOVE_FAILED",
+      `Git reported success but the managed worktree path could not be verified: ${worktreePath}.`,
+    );
+  }
+  throw new GitWorktreeError(
+    "GIT_WORKTREE_REMOVE_FAILED",
+    `Git reported success but the managed worktree still exists: ${worktreePath}.`,
+  );
 }
 
 export async function createManagedWorktree(input: {
@@ -178,6 +247,14 @@ async function git(args: string[], cwd: string): Promise<string> {
     const details = stderr || stdout || (error instanceof Error ? error.message : String(error));
     throw new Error(details);
   }
+}
+
+function isErrnoCode(error: unknown, code: string): boolean {
+  return Boolean(error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === code);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function isGitUnavailable(error: unknown): boolean {

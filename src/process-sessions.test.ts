@@ -56,7 +56,7 @@ const environment = await manager.start({
   yieldTimeMs: 2_000,
 });
 assert.equal(environment.running, false);
-assert.match(environment.output, /1,dumb,cat,cat,cat,1,workspace-a,\/tmp\/devspace-workspace-a/);
+assert.match(environment.output, /1,dumb,cat,cat,cat,1,workspace-a,.+devspace-workspace-a/);
 
 const background = await manager.start({
   workspaceId: "workspace-a",

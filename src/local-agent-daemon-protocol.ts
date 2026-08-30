@@ -7,6 +7,7 @@ import type {
   RunOverrides,
   StartLocalAgentInput,
 } from "./local-agent-manager.js";
+import { resolveSubagentsConfig, type SubagentsConfig } from "./local-agent-config.js";
 import type { LocalAgentWriteMode } from "./local-agent-runtime.js";
 import { LOCAL_AGENT_DAEMON_PROTOCOL_VERSION } from "./local-agent-daemon-lifecycle.js";
 
@@ -17,6 +18,7 @@ export type LocalAgentDaemonMethod =
   | "agent.get"
   | "agent.list"
   | "daemon.status"
+  | "daemon.reload"
   | "daemon.stop"
   | "daemon.logs";
 
@@ -27,6 +29,7 @@ export type LocalAgentDaemonRequest =
   | AgentDaemonRequestBase<"agent.get", { id: string; scope: LocalAgentWorkspaceScope }>
   | AgentDaemonRequestBase<"agent.list", LocalAgentWorkspaceScope>
   | AgentDaemonRequestBase<"daemon.status", Record<string, never>>
+  | AgentDaemonRequestBase<"daemon.reload", { subagents: SubagentsConfig }>
   | AgentDaemonRequestBase<"daemon.stop", Record<string, never>>
   | AgentDaemonRequestBase<"daemon.logs", { lines?: number }>;
 
@@ -98,6 +101,14 @@ export function decodeLocalAgentDaemonRequest(value: unknown): LocalAgentDaemonR
     case "daemon.status":
     case "daemon.stop":
       return { requestId, protocolVersion, authToken, method, params: decodeEmptyParams(params) } as LocalAgentDaemonRequest;
+    case "daemon.reload":
+      return {
+        requestId,
+        protocolVersion,
+        authToken,
+        method,
+        params: decodeReloadParams(params),
+      } as LocalAgentDaemonRequest;
     case "agent.start":
       return {
         requestId,
@@ -239,6 +250,22 @@ function decodeEmptyParams(value: unknown): Record<string, never> {
     throw new LocalAgentDaemonProtocolError("INVALID_PARAMS", "This daemon method does not accept parameters.");
   }
   return {};
+}
+
+function decodeReloadParams(value: unknown): { subagents: SubagentsConfig } {
+  const record = asRecord(value);
+  if (!record || !("subagents" in record)) {
+    throw new LocalAgentDaemonProtocolError("INVALID_PARAMS", "Subagent configuration is required.");
+  }
+  try {
+    return { subagents: resolveSubagentsConfig(record.subagents, {}) };
+  } catch (error) {
+    throw new LocalAgentDaemonProtocolError(
+      "INVALID_PARAMS",
+      `Invalid subagent configuration: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
 }
 
 function decodeStartInput(value: unknown): StartLocalAgentInput {

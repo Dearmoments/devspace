@@ -98,8 +98,6 @@ function formHtml(params: {
       </dl>
       <form method="post">
 ${hiddenFields}
-        <label for="owner_token">Owner password</label>
-        <input id="owner_token" name="owner_token" type="password" autocomplete="current-password" autofocus required />
         <button type="submit">Authorize DevSpace</button>
       </form>
     </main>
@@ -143,21 +141,6 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       res.status(200).setHeader("Content-Type", "text/html; charset=utf-8");
       res.send(
         formHtml({
-          clientName: client.client_name ?? client.client_id,
-          scopes: params.scopes ?? this.config.scopes,
-          resource: params.resource,
-          fields: authorizationFormFields(client, params),
-        }),
-      );
-      return;
-    }
-
-    const providedToken = String(res.req.body?.owner_token ?? "");
-    if (!safeEquals(providedToken, this.config.ownerToken)) {
-      res.status(401).setHeader("Content-Type", "text/html; charset=utf-8");
-      res.send(
-        formHtml({
-          error: "The Owner password was not accepted.",
           clientName: client.client_name ?? client.client_id,
           scopes: params.scopes ?? this.config.scopes,
           resource: params.resource,

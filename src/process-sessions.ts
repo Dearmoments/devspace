@@ -2,7 +2,10 @@ import { spawn } from "node:child_process";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
-const DEFAULT_INTERACTIVE_YIELD_MS = 250;
+// Bash startup on Windows (especially Git Bash) can take a little longer than
+// the old cmd.exe path. Give an interactive write enough time to observe the
+// resulting prompt/output without making callers opt into a custom yield.
+const DEFAULT_INTERACTIVE_YIELD_MS = 500;
 const DEFAULT_POLL_YIELD_MS = 5_000;
 const MAX_COMMAND_YIELD_MS = 30_000;
 const MAX_POLL_YIELD_MS = 110_000;
@@ -325,7 +328,7 @@ export class ProcessSessionManager {
   private startPipe(session: ProcessSession, input: StartCommandInput): void {
     const shell = resolveShellCommand(input.command);
     const detached = process.platform !== "win32";
-    const child = spawn(input.command, {
+    const child = spawn(shell.executable, shell.args, {
       cwd: input.cwd,
       env: processEnvironment({
         workspaceId: input.workspaceId,
@@ -334,13 +337,11 @@ export class ProcessSessionManager {
       stdio: "pipe",
       windowsHide: true,
       detached,
-      shell: shell.executable,
     });
 
     session.process = {
       write: (data) => child.stdin.write(data),
       kill: (signal = "SIGTERM") => terminateProcessTree(child, signal, detached),
-      resize: input.tty ? () => undefined : undefined,
     };
     child.stdout.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
     child.stderr.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));

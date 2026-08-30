@@ -1,7 +1,13 @@
-import { basename } from "node:path";
-import { spawnSync } from "node:child_process";
+import { basename, join, win32 as winPath } from "node:path";
+import { existsSync } from "node:fs";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 
 export interface ShellCommand {
+  executable: string;
+  args: string[];
+}
+
+export interface OpenFolderCommand {
   executable: string;
   args: string[];
 }
@@ -38,9 +44,16 @@ export function resolveShellCommand(
   environment: NodeJS.ProcessEnv = process.env,
 ): ShellCommand {
   if (platform === "win32") {
+    // DevSpace's command contract is Bash, including on Windows.  Passing
+    // ComSpec here makes POSIX commands (printf, &&, quoting, etc.) behave
+    // differently from the documented shell and also changes the encoding of
+    // command output.  Prefer an installed Git/MSYS/WSL Bash and leave a
+    // normal PATH lookup as the final fallback so the eventual spawn error is
+    // explicit when Bash is genuinely unavailable.
+    const bash = resolveWindowsBash(environment);
     return {
-      executable: environment.ComSpec ?? environment.COMSPEC ?? "cmd.exe",
-      args: ["/d", "/s", "/c", command],
+      executable: bash,
+      args: ["-c", command],
     };
   }
 
@@ -54,6 +67,97 @@ export function resolveShellCommand(
   }
 
   return { executable: "/bin/sh", args: ["-c", command] };
+}
+
+function resolveWindowsBash(environment: NodeJS.ProcessEnv): string {
+  const explicit = environment.DEVSPACE_BASH_PATH?.trim();
+  if (explicit) return explicit;
+
+  const configuredShell = environment.SHELL?.trim();
+  if (configuredShell && /(?:^|[\\/])bash(?:\.exe)?$/i.test(configuredShell)) {
+    return configuredShell;
+  }
+
+  const programFiles = environment.ProgramFiles;
+  const programFilesX86 = environment["ProgramFiles(x86)"];
+  const localAppData = environment.LOCALAPPDATA;
+  const candidates = [
+    programFiles ? winPath.join(programFiles, "Git", "bin", "bash.exe") : undefined,
+    programFiles ? winPath.join(programFiles, "Git", "usr", "bin", "bash.exe") : undefined,
+    programFilesX86 ? winPath.join(programFilesX86, "Git", "bin", "bash.exe") : undefined,
+    programFilesX86 ? winPath.join(programFilesX86, "Git", "usr", "bin", "bash.exe") : undefined,
+    localAppData ? winPath.join(localAppData, "Programs", "Git", "bin", "bash.exe") : undefined,
+  ];
+  for (const candidate of candidates) {
+    if (candidate && existsSync(candidate)) return candidate;
+  }
+
+  const pathValue = Object.entries(environment).find(([key]) => key.toLowerCase() === "path")?.[1] ?? "";
+  for (const entry of pathValue.split(";")) {
+    const trimmed = entry.trim().replace(/^"|"$/g, "");
+    if (!trimmed) continue;
+    const candidate = winPath.join(trimmed, "bash.exe");
+    if (existsSync(candidate)) return candidate;
+  }
+
+  // Let CreateProcess perform the final PATH lookup.  This keeps the failure
+  // on the command operation (with a useful Bash-not-found error) instead of
+  // silently falling back to cmd.exe.
+  return "bash.exe";
+}
+
+export function resolveOpenFolderCommand(
+  path: string,
+  platform: NodeJS.Platform = process.platform,
+): OpenFolderCommand {
+  if (!path) throw new Error("Folder path is required.");
+  switch (platform) {
+    case "win32":
+      return { executable: "explorer.exe", args: [path] };
+    case "darwin":
+      return { executable: "open", args: [path] };
+    case "linux":
+    case "freebsd":
+    case "openbsd":
+    case "sunos":
+      return { executable: "xdg-open", args: [path] };
+    default:
+      throw new Error(`Opening folders is not supported on ${platform}.`);
+  }
+}
+
+export function openFolder(
+  path: string,
+  platform: NodeJS.Platform = process.platform,
+  spawnProcess: typeof spawn = spawn,
+): Promise<void> {
+  const command = resolveOpenFolderCommand(path, platform);
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let child: ChildProcess;
+    try {
+      child = spawnProcess(command.executable, command.args, {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    child.once("spawn", () => {
+      if (settled) return;
+      settled = true;
+      child.unref();
+      resolve();
+    });
+  });
 }
 
 export function terminateProcessTree(

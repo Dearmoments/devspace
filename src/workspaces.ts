@@ -5,11 +5,11 @@ import type {
   WorkspaceMode,
   WorkspaceStore,
 } from "./workspace-store.js";
-import { mkdir, opendir, readFile, realpath, stat } from "node:fs/promises";
+import { opendir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
-import { createManagedWorktree } from "./git-worktrees.js";
+import { createManagedWorktree, removeManagedWorktree } from "./git-worktrees.js";
 import {
   AccessDeniedError,
   assertAllowedPath,
@@ -66,6 +66,12 @@ export interface WorkspaceContext {
   includeBootstrapContext: boolean;
 }
 
+export interface WorkspaceCloseResult {
+  workspaceId: string;
+  closed: boolean;
+  error?: unknown;
+}
+
 export interface WorkspaceReadPath {
   absolutePath: string;
   readRoots: string[];
@@ -85,12 +91,12 @@ export interface OpenWorkspaceOptions {
 type PathStats = Stats;
 type DirectoryOps = {
   stat: (path: string) => Promise<PathStats>;
-  mkdir: (path: string, options: { recursive: true }) => Promise<unknown>;
 };
 
 export class WorkspaceRegistry {
   private readonly workspaces = new Map<string, Workspace>();
   private readonly pendingCheckoutOpens = new Map<string, Promise<WorkspaceContext>>();
+  private readonly pendingWorkspaceCloses = new Map<string, Promise<WorkspaceCloseResult>>();
 
   constructor(
     private readonly config: ServerConfig,
@@ -144,6 +150,51 @@ export class WorkspaceRegistry {
         this.pendingCheckoutOpens.delete(operationKey);
       }
     }
+  }
+
+  /**
+   * Close one workspace explicitly. Managed worktrees are removed only after
+   * checking that the worktree itself is clean.
+   */
+  async closeWorkspace(workspaceId: string): Promise<WorkspaceCloseResult> {
+    const pending = this.pendingWorkspaceCloses.get(workspaceId);
+    if (pending) return pending;
+
+    const operation = this.closeWorkspaceInternal(workspaceId);
+    this.pendingWorkspaceCloses.set(workspaceId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.pendingWorkspaceCloses.get(workspaceId) === operation) {
+        this.pendingWorkspaceCloses.delete(workspaceId);
+      }
+    }
+  }
+
+  /**
+   * Release in-memory state and clean clean managed worktrees on shutdown.
+   * Checkout sessions remain persisted so they can be reused after restart;
+   * dirty worktrees remain intact for an explicit close later.
+   */
+  async close(): Promise<WorkspaceCloseResult[]> {
+    const ids = new Set<string>();
+    for (const workspace of this.workspaces.values()) {
+      if (workspace.mode === "worktree" && workspace.worktree?.managed) ids.add(workspace.id);
+    }
+    for (const session of this.store?.listSessions("active") ?? []) {
+      if (session.mode === "worktree" && session.managed) ids.add(session.id);
+    }
+
+    const results: WorkspaceCloseResult[] = [];
+    for (const workspaceId of ids) {
+      try {
+        results.push(await this.closeWorkspace(workspaceId));
+      } catch (error) {
+        results.push({ workspaceId, closed: false, error });
+      }
+    }
+    this.workspaces.clear();
+    return results;
   }
 
   private async openNewWorkspace(options: OpenWorkspaceInput): Promise<WorkspaceContext> {
@@ -250,7 +301,7 @@ export class WorkspaceRegistry {
     }
 
     const session = this.store?.getSession(workspaceId);
-    if (!session) {
+    if (!session || session.status !== "active") {
       throw new Error(
         `Unknown workspaceId: ${workspaceId}. Open the target project or worktree again and continue with the new workspaceId.`,
       );
@@ -342,12 +393,55 @@ export class WorkspaceRegistry {
       config: this.config,
     });
 
-    return this.createWorkspaceContext({
-      root: worktree.path,
-      mode: "worktree",
-      sourceRoot: worktree.sourceRoot,
-      worktree,
-    });
+    try {
+      return await this.createWorkspaceContext({
+        root: worktree.path,
+        mode: "worktree",
+        sourceRoot: worktree.sourceRoot,
+        worktree,
+      });
+    } catch (error) {
+      // Worktree creation precedes instruction/profile loading. If that later
+      // setup fails, clean the newly created worktree before propagating the
+      // original error.
+      await removeManagedWorktree({ worktree, config: this.config }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async closeWorkspaceInternal(workspaceId: string): Promise<WorkspaceCloseResult> {
+    const workspace = this.workspaces.get(workspaceId);
+    const session = this.store?.getSession(workspaceId);
+    if (!workspace && (!session || session.status !== "active")) {
+      throw new Error(`Unknown workspaceId: ${workspaceId}.`);
+    }
+
+    const mode = workspace?.mode ?? session?.mode;
+    const managed = workspace?.worktree?.managed ?? session?.managed ?? false;
+    if (mode === "worktree" && managed) {
+      const worktree = workspace?.worktree
+        ? {
+            ...workspace.worktree,
+            sourceRoot: workspace.sourceRoot ?? "",
+          }
+        : session ? {
+            path: session.root,
+            sourceRoot: session.sourceRoot ?? "",
+            baseRef: session.baseRef ?? "HEAD",
+            baseSha: session.baseSha ?? "",
+            dirtySource: false,
+            detached: true,
+            managed: true,
+          } : undefined;
+      if (!worktree || !worktree.sourceRoot) {
+        throw new Error(`Managed worktree ${workspaceId} is missing its source root.`);
+      }
+      await removeManagedWorktree({ worktree, config: this.config });
+    }
+
+    this.workspaces.delete(workspaceId);
+    this.store?.closeSession(workspaceId);
+    return { workspaceId, closed: true };
   }
 
   private async createWorkspaceContext(input: {
@@ -483,18 +577,12 @@ async function canonicalPath(path: string): Promise<string> {
 
 export async function ensureCheckoutWorkspaceRoot(
   path: string,
-  ops: DirectoryOps = { stat, mkdir },
+  ops: DirectoryOps = { stat },
 ): Promise<PathStats> {
-  try {
-    return await ops.stat(path);
-  } catch (error) {
-    if (!isErrnoException(error) || error.code !== "ENOENT") {
-      throw error;
-    }
-  }
-
-  await ops.mkdir(path, { recursive: true });
-  return await ops.stat(path);
+  // Opening a checkout is a read/validation operation.  In particular, do
+  // not manufacture a directory when a model supplies a typo: the caller
+  // needs the original ENOENT so it can correct the path.
+  return ops.stat(path);
 }
 
 const CONTEXT_FILE_NAMES = new Set(["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]);

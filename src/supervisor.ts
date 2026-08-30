@@ -9,7 +9,7 @@ import {
   adminCoreToolStates,
   applyAdminSettings,
   controlScheduledTask,
-  discoverProjects,
+  discoverProjectsDetailed,
   errorMessage,
   persistAdminSettings,
   readAdminLog,
@@ -26,6 +26,7 @@ import {
   windowsAdminModeSnapshot,
 } from "./windows-privileges.js";
 import { CloudflareTunnelMonitor } from "./tunnel-health.js";
+import { openFolder } from "./process-platform.js";
 
 const DEVSPACE_VERSION = (
   JSON.parse(
@@ -607,6 +608,7 @@ export function createSupervisor(
     try {
       const previousRuntime = runtimeSettingsFingerprint(config);
       const previousSchema = schemaSettingsFingerprint(config);
+      const previousSubagents = JSON.stringify(config.subagents);
       applyAdminSettings(config, req.body);
       const configPath = persistAdminSettings(config);
       const runtimeChanged = previousRuntime !== runtimeSettingsFingerprint(config);
@@ -617,12 +619,22 @@ export function createSupervisor(
         await controller.restart();
         backendRestarted = true;
       }
+      let agentDaemonReloaded = false;
+      if (previousSubagents !== JSON.stringify(config.subagents)) {
+        const daemonReload = await localAgentClient.reloadSubagents(config.subagents);
+        if (daemonReload.isOk()) {
+          agentDaemonReloaded = true;
+        } else if (daemonReload.error.code !== "DAEMON_UNAVAILABLE") {
+          console.error("agent daemon configuration reload failed", daemonReload.error.message);
+        }
+      }
       res.json({
         ok: true,
         configPath,
         schemaRevision,
         reconnectRecommended: schemaChanged,
         backendRestarted,
+        agentDaemonReloaded,
       });
     } catch (error) {
       res.status(400).json({ error: errorMessage(error) });
@@ -632,7 +644,8 @@ export function createSupervisor(
   app.get("/api/admin/projects", async (req, res) => {
     if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
     try {
-      res.json({ projects: await discoverProjects(config) });
+      const discovery = await discoverProjectsDetailed(config);
+      res.json({ projects: discovery.projects, rootDiagnostics: discovery.diagnostics });
     } catch (error) {
       res.status(500).json({ error: errorMessage(error) });
     }
@@ -642,11 +655,14 @@ export function createSupervisor(
     if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
     const target = typeof req.body?.path === "string" ? req.body.path : "";
     try {
-      const projects = await discoverProjects(config);
-      if (!projects.some((project) => project.path === target)) {
-        return res.status(400).json({ error: "Path is not an allowed project" });
+      const discovery = await discoverProjectsDetailed(config);
+      if (!discovery.projects.some((project) => project.path === target)) {
+        return res.status(400).json({
+          error: "Path is not an allowed project",
+          rootDiagnostics: discovery.diagnostics,
+        });
       }
-      spawn("explorer.exe", [target], { detached: true, stdio: "ignore" }).unref();
+      await openFolder(target);
       res.json({ ok: true });
     } catch (error) {
       res.status(500).json({ error: errorMessage(error) });

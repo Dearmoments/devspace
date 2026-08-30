@@ -10,6 +10,7 @@ type PrivilegeLevel = "administrator" | "limited" | "unknown" | "unsupported";
 type TaskRunLevel = "highest" | "limited" | "unknown" | "missing" | "unsupported";
 
 type Project = { name: string; path: string; root: string };
+type RootDraft = { id: string; value: string };
 type ToolState = { name: string; available: boolean; enabled: boolean };
 type Provider = { id?: string; name?: string; available?: boolean; enabled?: boolean; usable?: boolean; note?: string; model?: string; effort?: string; serviceTier?: string };
 type AdminStatus = {
@@ -73,6 +74,11 @@ type Session = {
 };
 
 type Notice = { kind: "ok" | "warn" | "error"; text: string } | null;
+
+let nextRootDraftId = 1;
+function createRootDraft(value: string): RootDraft {
+  return { id: `root-${nextRootDraftId++}`, value };
+}
 
 const NAV: Array<{ id: PageId; icon: string; label: string }> = [
   { id: "overview", icon: "⌂", label: "总览" },
@@ -158,7 +164,7 @@ function App() {
   const [logs, setLogs] = useState<string[]>([]);
   const [notice, setNotice] = useState<Notice>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [rootDrafts, setRootDrafts] = useState<string[]>([]);
+  const [rootDrafts, setRootDrafts] = useState<RootDraft[]>([]);
 
   const showNotice = useCallback((kind: NonNullable<Notice>["kind"], text: string) => {
     setNotice({ kind, text });
@@ -168,7 +174,7 @@ function App() {
   const loadStatus = useCallback(async () => {
     const next = await api<AdminStatus>("/api/admin/status");
     setStatus(next);
-    setRootDrafts((current) => current.length === 0 ? next.allowedRoots : current);
+    setRootDrafts((current) => current.length === 0 ? next.allowedRoots.map(createRootDraft) : current);
     return next;
   }, []);
 
@@ -223,9 +229,12 @@ function App() {
   const saveSettings = async (patch: Record<string, unknown>, successText = "设置已保存") => {
     setBusy("settings");
     try {
-      const result = await postJson<{ reconnectRecommended?: boolean }>("/api/admin/settings", patch);
+      const result = await postJson<{ reconnectRecommended?: boolean; agentDaemonReloaded?: boolean }>("/api/admin/settings", patch);
       await loadStatus();
-      showNotice(result.reconnectRecommended ? "warn" : "ok", result.reconnectRecommended ? `${successText}；MCP 能力有变化，建议重新连接客户端` : successText);
+      const daemonNote = result.agentDaemonReloaded === false && patch.subagentProviders !== undefined
+        ? "；Agent Daemon 将在下次启动时读取新配置"
+        : "";
+      showNotice(result.reconnectRecommended ? "warn" : "ok", result.reconnectRecommended ? `${successText}；MCP 能力有变化，建议重新连接客户端${daemonNote}` : `${successText}${daemonNote}`);
     } catch (error) {
       showNotice("error", error instanceof Error ? error.message : String(error));
       throw error;
@@ -348,8 +357,8 @@ function App() {
         {page === "network" && status && <Network status={status} />}
         {page === "logs" && <Logs source={logSource} setSource={setLogSource} lines={logs} onRefresh={() => loadLogs()} />}
         {page === "settings" && status && <Settings status={status} roots={rootDrafts} setRoots={setRootDrafts} busy={busy} onAdminMode={setAdminMode} onSave={async (patch) => {
-          await saveSettings(patch, "系统设置已保存");
-          setRootDrafts((await loadStatus()).allowedRoots);
+           await saveSettings(patch, "系统设置已保存");
+           setRootDrafts((await loadStatus()).allowedRoots.map(createRootDraft));
         }} />}
       </main>
     </div>
@@ -545,16 +554,16 @@ function Logs({ source, setSource, lines, onRefresh }: { source: "server" | "tun
   </>;
 }
 
-function Settings({ status, roots, setRoots, busy, onAdminMode, onSave }: { status: AdminStatus; roots: string[]; setRoots: (roots: string[]) => void; busy: string | null; onAdminMode: (enabled: boolean) => Promise<void>; onSave: (patch: Record<string, unknown>) => Promise<void> }) {
+function Settings({ status, roots, setRoots, busy, onAdminMode, onSave }: { status: AdminStatus; roots: RootDraft[]; setRoots: (roots: RootDraft[]) => void; busy: string | null; onAdminMode: (enabled: boolean) => Promise<void>; onSave: (patch: Record<string, unknown>) => Promise<void> }) {
   const [toolMode, setToolMode] = useState<ToolMode>(status.settings.toolMode);
   const [widgets, setWidgets] = useState<WidgetMode>(status.settings.widgets);
   useEffect(() => { setToolMode(status.settings.toolMode); setWidgets(status.settings.widgets); }, [status.settings.toolMode, status.settings.widgets]);
-  const save = () => onSave({ allowedRoots: roots.filter((root) => root.trim()), toolMode, widgets });
+  const save = () => onSave({ allowedRoots: roots.map((root) => root.value).filter((root) => root.trim()), toolMode, widgets });
   return <>
-    <SectionHeader eyebrow="PERSISTED CONFIG" title="设置" description="这些设置会写入 ~/.devspace/config.json；环境变量仍具有更高优先级。" actions={<button className="primary" disabled={busy !== null || roots.every((root) => !root.trim())} onClick={() => void save()}>保存设置</button>} />
-    <div className="settings-grid">
-      <section className="panel settings-panel wide"><div className="settings-title"><div><h2>Allowed Roots</h2><p>允许 DevSpace 打开工作区的文件系统边界。</p></div><button className="secondary" onClick={() => setRoots([...roots, ""])}>＋ 添加 Root</button></div>
-        <div className="root-editor">{roots.map((root, index) => <div key={`${index}:${root}`}><input value={root} placeholder="E:\\Projects" onChange={(event) => setRoots(roots.map((value, position) => position === index ? event.target.value : value))} /><button className="danger-soft" disabled={roots.length <= 1} onClick={() => setRoots(roots.filter((_, position) => position !== index))}>删除</button></div>)}</div>
+     <SectionHeader eyebrow="PERSISTED CONFIG" title="设置" description="这些设置会写入 ~/.devspace/config.json；环境变量仍具有更高优先级。" actions={<button className="primary" disabled={busy !== null || roots.every((root) => !root.value.trim())} onClick={() => void save()}>保存设置</button>} />
+     <div className="settings-grid">
+       <section className="panel settings-panel wide"><div className="settings-title"><div><h2>Allowed Roots</h2><p>允许 DevSpace 打开工作区的文件系统边界。</p></div><button className="secondary" onClick={() => setRoots([...roots, createRootDraft("")])}>＋ 添加 Root</button></div>
+         <div className="root-editor">{roots.map((root) => <div key={root.id}><input value={root.value} placeholder="E:\\Projects" onChange={(event) => setRoots(roots.map((entry) => entry.id === root.id ? { ...entry, value: event.target.value } : entry))} /><button className="danger-soft" disabled={roots.length <= 1} onClick={() => setRoots(roots.filter((entry) => entry.id !== root.id))}>删除</button></div>)}</div>
       </section>
       <section className="panel settings-panel wide permission-panel">
         <div className="settings-title"><div><h2>权限与启动</h2><p>切换 Windows 计划任务的 RunLevel。开启后 Supervisor 与它启动的 MCP Server 都会继承管理员令牌。</p></div></div>

@@ -11,7 +11,7 @@ import { LocalAgentManager } from "./local-agent-manager.js";
 import { LocalAgentRuntimePool } from "./local-agent-runtime-pool.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 
-const config = loadConfig();
+let config = loadConfig();
 const DEFAULT_DAEMON_SHUTDOWN_TIMEOUT_MS = 10_000;
 const paths = localAgentDaemonPaths(config.stateDir);
 const log = (
@@ -29,6 +29,9 @@ const manager = new LocalAgentManager({
   allowedRoots: config.allowedRoots,
   logger: log,
   subagents: config.subagents,
+  onSubagentsReloaded: (subagents) => {
+    config = { ...config, subagents };
+  },
 });
 const daemon = new LocalAgentDaemon({
   stateDir: paths.stateDir,

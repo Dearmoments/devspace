@@ -41,7 +41,9 @@ export interface WorkspaceStore {
     managed?: boolean;
   }): WorkspaceSession;
   getSession(id: string): WorkspaceSession | undefined;
+  listSessions(status?: string): WorkspaceSession[];
   touchSession(id: string): void;
+  closeSession(id: string): void;
   getConversationBinding(
     conversationScopeId: string,
     targetKey: string,
@@ -115,11 +117,31 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     return row ? rowToWorkspaceSession(row) : undefined;
   }
 
+  listSessions(status?: string): WorkspaceSession[] {
+    const query = this.database.db.select().from(workspaceSessions);
+    const rows = status === undefined
+      ? query.all()
+      : query.where(eq(workspaceSessions.status, status)).all();
+    return rows.map(rowToWorkspaceSession);
+  }
+
   touchSession(id: string): void {
     this.database.db
       .update(workspaceSessions)
       .set({ lastUsedAt: new Date().toISOString() })
       .where(eq(workspaceSessions.id, id))
+      .run();
+  }
+
+  closeSession(id: string): void {
+    this.database.db
+      .update(workspaceSessions)
+      .set({ status: "closed", lastUsedAt: new Date().toISOString() })
+      .where(eq(workspaceSessions.id, id))
+      .run();
+    this.database.db
+      .delete(workspaceConversationBindings)
+      .where(eq(workspaceConversationBindings.workspaceSessionId, id))
       .run();
   }
 

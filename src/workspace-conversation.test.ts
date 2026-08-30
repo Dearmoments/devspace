@@ -189,26 +189,31 @@ test("a context-loading failure preserves a valid checkout binding", async (t) =
   assert.equal(recovered.workspace.id, first.workspace.id);
 });
 
-test("a deleted checkout is replaced with a new workspace", async (t) => {
+test("a deleted checkout is rejected without recreating it, then replaced after the directory returns", async (t) => {
   const { project, registry } = await fixture(t);
   const first = await registry.openWorkspace(project, { conversationScopeId: "chat-1" });
 
   await rm(project, { recursive: true, force: true });
-  const replacement = await registry.openWorkspace(project, { conversationScopeId: "chat-1" });
+  await assert.rejects(
+    () => registry.openWorkspace(project, { conversationScopeId: "chat-1" }),
+    /ENOENT|no such file|不存在/i,
+  );
+  await assert.rejects(() => stat(project), /ENOENT|no such file|不存在/i);
 
+  await mkdir(project, { recursive: true });
+  const replacement = await registry.openWorkspace(project, { conversationScopeId: "chat-1" });
   assert.notEqual(replacement.workspace.id, first.workspace.id);
-  assert.equal((await stat(project)).isDirectory(), true);
 });
 
-test("canonical checkout identity remains stable when the requested target starts missing", async (t) => {
+test("a missing conversation checkout target is rejected without creating it", async (t) => {
   const { project, registry } = await fixture(t);
   const missingTarget = join(project, "generated", "checkout");
 
-  const first = await registry.openWorkspace(missingTarget, { conversationScopeId: "chat-1" });
-  const second = await registry.openWorkspace(missingTarget, { conversationScopeId: "chat-1" });
-
-  assert.equal(first.workspace.root, missingTarget);
-  assert.equal(second.workspace.id, first.workspace.id);
+  await assert.rejects(
+    () => registry.openWorkspace(missingTarget, { conversationScopeId: "chat-1" }),
+    /ENOENT|no such file|不存在/i,
+  );
+  await assert.rejects(() => stat(missingTarget), /ENOENT|no such file|不存在/i);
 });
 
 test("canonical checkout identity survives equivalent path and symlink aliases", async (t) => {
@@ -315,6 +320,7 @@ test("an inactive persisted checkout binding is not reused", async (t) => {
 test("a checkout replaced by a file reports the filesystem error", async (t) => {
   const context = await fixture(t);
   const target = join(context.root, "file-target");
+  await mkdir(target, { recursive: true });
   await context.registry.openWorkspace(target, { conversationScopeId: "chat-1" });
   await rm(target, { recursive: true, force: true });
   await writeFile(target, "not a directory\n");

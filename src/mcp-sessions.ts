@@ -23,18 +23,26 @@ interface McpSessionEntry<TTransport> {
   connectedAt: number;
   lastActivityAt: number;
   metadata: McpSessionMetadata;
+  activeConnections: number;
+  abandonTimer?: NodeJS.Timeout;
 }
 
 export interface McpSessionRegistryOptions {
   now?: () => number;
+  abandonGraceMs?: number;
 }
 
 export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   private readonly sessions = new Map<string, McpSessionEntry<TTransport>>();
   private readonly now: () => number;
+  private readonly abandonGraceMs: number;
 
   constructor(options: McpSessionRegistryOptions = {}) {
     this.now = options.now ?? Date.now;
+    this.abandonGraceMs = options.abandonGraceMs ?? 30_000;
+    if (!Number.isFinite(this.abandonGraceMs) || this.abandonGraceMs < 0) {
+      throw new Error("MCP session abandon grace must be a non-negative finite duration.");
+    }
   }
 
   get size(): number {
@@ -48,6 +56,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
       connectedAt: now,
       lastActivityAt: now,
       metadata,
+      activeConnections: 0,
     });
   }
 
@@ -63,6 +72,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   async close(sessionId: string): Promise<McpSessionCloseResult | undefined> {
     const entry = this.sessions.get(sessionId);
     if (!entry) return undefined;
+    this.clearAbandonTimer(entry);
     this.sessions.delete(sessionId);
     const [result] = await closeSessions([{ sessionId, transport: entry.transport }]);
     return result;
@@ -72,11 +82,31 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     const entry = this.sessions.get(sessionId);
     if (!entry) return undefined;
 
-    entry.lastActivityAt = this.now();
+    this.touchEntry(entry);
     return entry.transport;
   }
 
+  beginRequest(sessionId: string): boolean {
+    const entry = this.sessions.get(sessionId);
+    if (!entry) return false;
+    this.clearAbandonTimer(entry);
+    entry.activeConnections += 1;
+    this.touchEntry(entry);
+    return true;
+  }
+
+  endRequest(sessionId: string, abnormal = false): void {
+    const entry = this.sessions.get(sessionId);
+    if (!entry) return;
+    entry.activeConnections = Math.max(0, entry.activeConnections - 1);
+    this.touchEntry(entry);
+    if (abnormal && entry.activeConnections === 0) this.scheduleAbandonClose(sessionId, entry);
+  }
+
   remove(sessionId: string): boolean {
+    const entry = this.sessions.get(sessionId);
+    if (!entry) return false;
+    this.clearAbandonTimer(entry);
     return this.sessions.delete(sessionId);
   }
 
@@ -87,6 +117,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     for (const [sessionId, entry] of this.sessions) {
       if (entry.lastActivityAt > cutoff) continue;
 
+      this.clearAbandonTimer(entry);
       this.sessions.delete(sessionId);
       idleSessions.push({ sessionId, transport: entry.transport });
     }
@@ -99,8 +130,34 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
       sessionId,
       transport: entry.transport,
     }));
+    for (const entry of this.sessions.values()) this.clearAbandonTimer(entry);
     this.sessions.clear();
     return closeSessions(sessions);
+  }
+
+  private touchEntry(entry: McpSessionEntry<TTransport>): void {
+    entry.lastActivityAt = this.now();
+  }
+
+  private clearAbandonTimer(entry: McpSessionEntry<TTransport>): void {
+    if (!entry.abandonTimer) return;
+    clearTimeout(entry.abandonTimer);
+    entry.abandonTimer = undefined;
+  }
+
+  private scheduleAbandonClose(sessionId: string, entry: McpSessionEntry<TTransport>): void {
+    this.clearAbandonTimer(entry);
+    if (this.abandonGraceMs === 0) {
+      void this.close(sessionId);
+      return;
+    }
+    entry.abandonTimer = setTimeout(() => {
+      entry.abandonTimer = undefined;
+      const current = this.sessions.get(sessionId);
+      if (!current || current !== entry || current.activeConnections > 0) return;
+      void this.close(sessionId);
+    }, this.abandonGraceMs);
+    entry.abandonTimer.unref();
   }
 }
 

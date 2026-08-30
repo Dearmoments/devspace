@@ -13,6 +13,7 @@ const execFileAsync = promisify(execFile);
 export const ADMIN_CORE_TOOLS = [
   "list_projects",
   "open_workspace",
+  "close_workspace",
   "read",
   "write",
   "edit",
@@ -38,6 +39,16 @@ export interface AdminServiceStatus {
   note?: string;
 }
 
+export interface ProjectDiscoveryDiagnostic {
+  root: string;
+  error: string;
+}
+
+export interface ProjectDiscoveryResult {
+  projects: Array<{ name: string; path: string; root: string }>;
+  diagnostics: ProjectDiscoveryDiagnostic[];
+}
+
 interface ScheduledTaskSnapshot {
   taskName: string;
   state: AdminServiceState;
@@ -52,14 +63,44 @@ export function adminCoreToolStates(config: ServerConfig) {
 }
 
 export async function discoverProjects(config: ServerConfig): Promise<Array<{ name: string; path: string; root: string }>> {
-  return (await Promise.all(config.allowedRoots.map(async (root) => {
-    const entries = await readdir(root, { withFileTypes: true });
-    return entries.filter((entry) => entry.isDirectory()).map((entry) => ({
-      name: entry.name,
-      path: join(root, entry.name),
-      root,
-    }));
-  }))).flat().sort((left, right) => left.path.localeCompare(right.path));
+  return (await discoverProjectsDetailed(config)).projects;
+}
+
+/**
+ * Discover each configured root independently.  A disconnected drive or a
+ * deleted directory must not hide projects that are still available under
+ * the other roots.
+ */
+export async function discoverProjectsDetailed(config: ServerConfig): Promise<ProjectDiscoveryResult> {
+  const results = await Promise.all(config.allowedRoots.map(async (root) => {
+    try {
+      const entries = await readdir(root, { withFileTypes: true });
+      return {
+        projects: entries.filter((entry) => entry.isDirectory()).map((entry) => ({
+          name: entry.name,
+          path: join(root, entry.name),
+          root,
+        })),
+        diagnostic: undefined,
+      };
+    } catch (error) {
+      return {
+        projects: [],
+        diagnostic: {
+          root,
+          error: errorMessage(error),
+        },
+      };
+    }
+  }));
+
+  return {
+    projects: results
+      .flatMap((result) => result.projects)
+      .sort((left, right) => left.path.localeCompare(right.path)),
+    diagnostics: results
+      .flatMap((result) => result.diagnostic ? [result.diagnostic] : []),
+  };
 }
 
 export function applyAdminSettings(config: ServerConfig, body: unknown): void {
@@ -210,7 +251,7 @@ export function errorMessage(error: unknown): string {
 
 function coreToolModeAvailable(config: ServerConfig, tool: string): boolean {
   if (config.toolMode === "codex") {
-    return new Set<string>(["list_projects", "open_workspace", "read"]).has(tool);
+    return new Set<string>(["list_projects", "open_workspace", "close_workspace", "read"]).has(tool);
   }
   if (config.toolMode === "minimal") {
     return !new Set<string>(["grep", "glob", "ls"]).has(tool);

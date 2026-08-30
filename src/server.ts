@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
 import { join } from "node:path";
@@ -29,7 +28,7 @@ import {
   adminCoreToolStates,
   applyAdminSettings,
   controlScheduledTask,
-  discoverProjects,
+  discoverProjectsDetailed,
   errorMessage,
   persistAdminSettings,
   readAdminLog,
@@ -64,6 +63,7 @@ import {
   type McpSessionCloseResult,
 } from "./mcp-sessions.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
+import { openFolder } from "./process-platform.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { openAiConversationScopeId } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
@@ -83,8 +83,9 @@ import {
 type Transport = StreamableHTTPServerTransport;
 // MCP clients can reconnect without closing the previous transport. Bound stale
 // session retention so abandoned MCP servers do not accumulate for the life of the process.
-const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
-const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
+const MCP_SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1_000;
+const MCP_SESSION_CLEANUP_INTERVAL_MS = 60 * 1_000;
+const MCP_SESSION_ABANDON_GRACE_MS = 30 * 1_000;
 const DEVSPACE_VERSION = (
   JSON.parse(
     readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"),
@@ -190,6 +191,7 @@ function toolWidgetDescriptorMeta(
 const toolNames = {
   listProjects: "list_projects",
   openWorkspace: "open_workspace",
+  closeWorkspace: "close_workspace",
   read: "read",
   write: "write",
   edit: "edit",
@@ -231,7 +233,7 @@ function serverInstructions(config: ServerConfig): string {
       : "";
 
   if (config.toolMode === "codex") {
-    return `Use DevSpace for coding work. When the user has not supplied an exact project path, call ${toolNames.listProjects} first and use one of its returned paths. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${disabledToolsInstruction}`;
+    return `Use DevSpace for coding work. When the user has not supplied an exact project path, call ${toolNames.listProjects} first and use one of its returned paths. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. When finished with an isolated worktree, call ${toolNames.closeWorkspace} after the user has confirmed its changes are committed or no longer needed. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${disabledToolsInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -244,7 +246,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use DevSpace for coding work. When the user has not supplied an exact project path, call ${toolNames.listProjects} first and use one of its returned paths. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${disabledToolsInstruction}`;
+  return `Use DevSpace for coding work. When the user has not supplied an exact project path, call ${toolNames.listProjects} first and use one of its returned paths. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. When finished with an isolated worktree, call ${toolNames.closeWorkspace} after the user has confirmed its changes are committed or no longer needed. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${disabledToolsInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -338,6 +340,32 @@ function sendJsonRpcError(
     error: { code, message },
     id: null,
   });
+}
+
+function trackMcpRequestLifecycle(
+  req: Request,
+  res: Response,
+  transports: McpSessionRegistry<Transport>,
+  transport: Transport,
+  sessionId?: string,
+): void {
+  let released = false;
+  const release = (abnormal: boolean): void => {
+    if (released) return;
+    released = true;
+    const id = sessionId ?? transport.sessionId;
+    if (id) {
+      transports.endRequest(id, abnormal);
+    } else if (abnormal) {
+      // An initialize request can be aborted before the SDK assigns a session
+      // id. Close that unregistered transport as well.
+      void transport.close().catch(() => undefined);
+    }
+  };
+
+  req.once("aborted", () => release(true));
+  res.once("finish", () => release(false));
+  res.once("close", () => release(!res.writableFinished));
 }
 
 function requestLogFields(req: Request, config: ServerConfig): Record<string, unknown> {
@@ -790,8 +818,7 @@ export function createMcpServer(
   );
 
   if (isCoreToolEnabled(config, toolNames.listProjects)) {
-  registerAppTool(
-    server,
+  server.registerTool(
     toolNames.listProjects,
     {
       title: "List available projects",
@@ -806,8 +833,11 @@ export function createMcpServer(
           path: z.string(),
           root: z.string(),
         })),
+        rootDiagnostics: z.array(z.object({
+          root: z.string(),
+          error: z.string(),
+        })),
       },
-      ...toolWidgetDescriptorMeta(config, "workspace"),
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -817,7 +847,8 @@ export function createMcpServer(
     },
     async () => {
       const startedAt = performance.now();
-      const projects = await discoverProjects(config);
+      const discovery = await discoverProjectsDetailed(config);
+      const projects = discovery.projects;
       const lines = [
         "Available DevSpace roots:",
         ...config.allowedRoots.map((root) => `- ${root}`),
@@ -826,6 +857,13 @@ export function createMcpServer(
         ...(projects.length > 0
           ? projects.map((project) => `- ${project.name}: ${project.path}`)
           : ["- No project directories found."]),
+        ...(discovery.diagnostics.length > 0
+          ? [
+              "",
+              "Roots that could not be scanned:",
+              ...discovery.diagnostics.map((diagnostic) => `- ${diagnostic.root}: ${diagnostic.error}`),
+            ]
+          : []),
       ];
       const result = lines.join("\n");
       const content: ToolContent[] = [{ type: "text", text: result }];
@@ -842,19 +880,7 @@ export function createMcpServer(
           result,
           roots: config.allowedRoots,
           projects,
-        },
-        _meta: {
-          tool: toolNames.listProjects,
-          card: {
-            tool: toolNames.listProjects,
-            summary: {
-              roots: config.allowedRoots.length,
-              projects: projects.length,
-            },
-            roots: config.allowedRoots,
-            projects,
-            payload: { content },
-          },
+          rootDiagnostics: discovery.diagnostics,
         },
       };
     },
@@ -910,7 +936,14 @@ export function createMcpServer(
         instruction: z.string(),
       },
       ...toolWidgetDescriptorMeta(config, "workspace"),
-      annotations: { readOnlyHint: true },
+      // This operation records a workspace session and may create a managed
+      // Git worktree, so advertising it as read-only is misleading.
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
     },
     async ({ path, mode, baseRef }, { _meta }) => {
       const startedAt = performance.now();
@@ -1063,6 +1096,50 @@ export function createMcpServer(
       };
     },
   );
+  }
+
+  if (isCoreToolEnabled(config, toolNames.closeWorkspace)) {
+    server.registerTool(
+      toolNames.closeWorkspace,
+      {
+        title: "Close workspace",
+        description:
+          "Close a workspace. For a managed worktree this removes the isolated Git worktree only when it is clean; commit or discard changes first.",
+        inputSchema: {
+          workspaceId: z.string().describe(workspaceIdDescription),
+        },
+        outputSchema: {
+          result: z.string(),
+          workspaceId: z.string(),
+          closed: z.boolean(),
+        },
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ workspaceId }) => {
+        const startedAt = performance.now();
+        const closed = await workspaces.closeWorkspace(workspaceId);
+        const result = `Closed workspace ${workspaceId}.`;
+        logToolCall(config, {
+          tool: toolNames.closeWorkspace,
+          workspaceId,
+          success: true,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+        return {
+          content: [{ type: "text" as const, text: result }],
+          structuredContent: {
+            result,
+            workspaceId: closed.workspaceId,
+            closed: closed.closed,
+          },
+        };
+      },
+    );
   }
 
   if (isCoreToolEnabled(config, toolNames.read)) {
@@ -1803,7 +1880,9 @@ export function createServer(
     host: config.host,
     ...(allowedHosts ? { allowedHosts } : {}),
   });
-  const transports = new McpSessionRegistry<Transport>();
+  const transports = new McpSessionRegistry<Transport>({
+    abandonGraceMs: MCP_SESSION_ABANDON_GRACE_MS,
+  });
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
@@ -2091,9 +2170,10 @@ export function createServer(
     logSessionCloseResults("schema_reload", results);
     res.json({ ok: true, schemaRevision, closed: results.length });
   });
-  app.post("/api/admin/settings", (req, res) => {
+  app.post("/api/admin/settings", async (req, res) => {
     if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
     try {
+      const previousSubagents = JSON.stringify(config.subagents);
       const previousSchema = JSON.stringify({
         toolMode: config.toolMode,
         widgets: config.widgets,
@@ -2113,11 +2193,28 @@ export function createServer(
         artifactsEnabled: config.artifactsEnabled,
       });
       if (previousSchema !== nextSchema) schemaRevision += 1;
+      let agentDaemonReloaded = false;
+      if (previousSubagents !== JSON.stringify(config.subagents)) {
+        const daemonReload = await localAgentClient.reloadSubagents(config.subagents);
+        if (daemonReload.isOk()) {
+          agentDaemonReloaded = true;
+        } else if (daemonReload.error.code !== "DAEMON_UNAVAILABLE") {
+          logEvent(config.logging, "warn", "agent_daemon_config_reload_failed", {
+            error: daemonReload.error.message,
+          });
+        }
+      }
       logEvent(config.logging, "info", "admin_settings_updated", {
         configPath,
         schemaRevision,
       });
-      res.json({ ok: true, configPath, schemaRevision, reconnectRecommended: previousSchema !== nextSchema });
+      res.json({
+        ok: true,
+        configPath,
+        schemaRevision,
+        reconnectRecommended: previousSchema !== nextSchema,
+        agentDaemonReloaded,
+      });
     } catch (error) {
       res.status(400).json({ error: errorMessage(error) });
     }
@@ -2142,16 +2239,28 @@ export function createServer(
   });
   app.get("/api/admin/projects", async (req, res) => {
     if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
-    try { res.json({ projects: await discoverProjects(config) }); }
+    try {
+      const discovery = await discoverProjectsDetailed(config);
+      res.json({ projects: discovery.projects, rootDiagnostics: discovery.diagnostics });
+    }
     catch (error) { res.status(500).json({ error: errorMessage(error) }); }
   });
   app.post("/api/admin/open-folder", async (req, res) => {
     if (!isLocalAdminRequest(req)) return res.status(404).json({ error: "Not found" });
     const target = typeof req.body?.path === "string" ? req.body.path : "";
-    const projects = await discoverProjects(config);
-    if (!projects.some((project) => project.path === target)) return res.status(400).json({ error: "Path is not an allowed project" });
-    spawn("explorer.exe", [target], { detached: true, stdio: "ignore" }).unref();
-    res.json({ ok: true });
+    try {
+      const discovery = await discoverProjectsDetailed(config);
+      if (!discovery.projects.some((project) => project.path === target)) {
+        return res.status(400).json({
+          error: "Path is not an allowed project",
+          rootDiagnostics: discovery.diagnostics,
+        });
+      }
+      await openFolder(target);
+      res.json({ ok: true });
+    } catch (error) {
+      res.status(500).json({ error: errorMessage(error) });
+    }
   });
 
   app.get("/healthz", (_req, res) => {
@@ -2200,14 +2309,18 @@ export function createServer(
           sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
           return;
         }
+        transports.beginRequest(sessionId);
       } else if (initializeRequest) {
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
-            if (transport) transports.register(newSessionId, transport, {
-              client: req.header("user-agent") ?? "MCP client",
-              schemaRevision,
-            });
+            if (transport) {
+              transports.register(newSessionId, transport, {
+                client: req.header("user-agent") ?? "MCP client",
+                schemaRevision,
+              });
+              transports.beginRequest(newSessionId);
+            }
             logEvent(config.logging, "info", "mcp_session_created", {
               requestId,
               sessionIdPrefix: sessionIdPrefix(newSessionId),
@@ -2215,6 +2328,8 @@ export function createServer(
             });
           },
         });
+
+        trackMcpRequestLifecycle(req, res, transports, transport);
 
         transport.onclose = () => {
           const closedSessionId = transport?.sessionId;
@@ -2240,6 +2355,8 @@ export function createServer(
         return;
       }
 
+      if (sessionId) trackMcpRequestLifecycle(req, res, transports, transport, sessionId);
+
       await transport.handleRequest(req, res, req.body);
     } catch (error) {
       logEvent(config.logging, "error", "mcp_request_error", {
@@ -2263,6 +2380,15 @@ export function createServer(
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
         processSessions.shutdown();
+        const workspaceResults = await workspaces.close();
+        for (const result of workspaceResults) {
+          if (result.error) {
+            logEvent(config.logging, "warn", "workspace_close_failed", {
+              workspaceId: result.workspaceId,
+              error: errorMessage(result.error),
+            });
+          }
+        }
         oauthProvider.close();
         workspaceStore.close?.();
       })();

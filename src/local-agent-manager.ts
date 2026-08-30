@@ -66,6 +66,7 @@ export interface LocalAgentManagerOptions {
   allowedRoots?: readonly string[];
   logger?: LocalAgentManagerLogger;
   subagents: SubagentsConfig;
+  onSubagentsReloaded?: (config: SubagentsConfig) => void;
 }
 
 export type AgentStartError = AgentTargetError | AgentScopeError | AgentConflictError | AgentStoreError;
@@ -86,7 +87,8 @@ export class LocalAgentManager {
   private readonly agentDir?: string;
   private readonly allowedRoots?: readonly string[];
   private readonly logger?: LocalAgentManagerLogger;
-  private readonly subagents: SubagentsConfig;
+  private subagents: SubagentsConfig;
+  private readonly onSubagentsReloaded?: (config: SubagentsConfig) => void;
   private readonly activeTurns = new Map<string, Promise<void>>();
   private accepting = true;
   private closePromise?: Promise<void>;
@@ -100,6 +102,19 @@ export class LocalAgentManager {
     this.allowedRoots = options.allowedRoots;
     this.logger = options.logger;
     this.subagents = options.subagents;
+    this.onSubagentsReloaded = options.onSubagentsReloaded;
+  }
+
+  reloadSubagents(config: SubagentsConfig): void {
+    this.subagents = {
+      enabled: config.enabled,
+      providers: config.providers.map((provider) => ({ ...provider })),
+    };
+    this.onSubagentsReloaded?.(this.subagents);
+    this.log("info", "local_agent_config_reloaded", {
+      enabled: this.subagents.enabled,
+      providers: this.subagents.providers.filter((provider) => provider.enabled).map((provider) => provider.id),
+    });
   }
 
   reconcileActiveRuns(message?: string): BetterResult<number, AgentStoreError> {

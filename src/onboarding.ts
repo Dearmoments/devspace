@@ -29,6 +29,10 @@ export function usesCodingAgents(usage: OnboardingUsage): boolean {
   return usage === "coding-agents" || usage === "both";
 }
 
+export function disableOnboardingSubagents(): SubagentsConfig {
+  return { enabled: false, providers: [] };
+}
+
 export function updateOnboardingSubagentsConfig(
   current: SubagentsConfig,
   selectedProviders: readonly LocalAgentProvider[],

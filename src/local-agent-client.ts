@@ -5,6 +5,7 @@ import { createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
 import { matchError, Result, type Result as BetterResult } from "better-result";
 import type { ServerConfig } from "./config.js";
+import type { SubagentsConfig } from "./local-agent-config.js";
 import {
   AgentDaemonInvalidRequestError,
   AgentDaemonInvalidResponseError,
@@ -138,6 +139,46 @@ export class LocalAgentClient {
   async stop(): Promise<BetterResult<LocalAgentDaemonStatus, AgentDaemonError>> {
     const result = await this.requestExisting("daemon.stop", {});
     return decodeRequestResult(result, "daemon.stop", decodeDaemonStatus);
+  }
+
+  async reloadSubagents(
+    subagents: SubagentsConfig,
+  ): Promise<BetterResult<LocalAgentDaemonStatus, AgentDaemonError>> {
+    const result = await this.requestExisting("daemon.reload", { subagents });
+    const decoded = decodeRequestResult(result, "daemon.reload", decodeDaemonStatus);
+    if (
+      decoded.isErr()
+      && (decoded.error.code === "DAEMON_INVALID_REQUEST" || decoded.error.code === "DAEMON_PROTOCOL_MISMATCH")
+    ) {
+      // A daemon started by an older DevSpace build does not know the reload
+      // method. Replace it only after its current process has stopped, then
+      // let the new process read the persisted configuration.
+      return this.restart();
+    }
+    return decoded;
+  }
+
+  async restart(): Promise<BetterResult<LocalAgentDaemonStatus, AgentDaemonError>> {
+    const current = await this.status();
+    if (current.isErr()) return current;
+
+    const stopped = await this.stop();
+    if (stopped.isErr()) return stopped;
+
+    const deadline = Date.now() + this.startupTimeoutMs;
+    while (Date.now() < deadline) {
+      if (!existsSync(this.paths.lockPath) || !isProcessAlive(current.value.pid)) break;
+      await delay(RETRY_DELAY_MS);
+    }
+    if (existsSync(this.paths.lockPath) && isProcessAlive(current.value.pid)) {
+      return Result.err(new AgentDaemonStartupError({
+        code: "DAEMON_STARTUP_FAILURE",
+        operation: "restart",
+        retryable: true,
+        message: "The local agent daemon did not stop in time for a configuration refresh.",
+      }));
+    }
+    return this.ensureReady();
   }
 
   async logs(lines = 200): Promise<BetterResult<string, AgentDaemonError>> {
@@ -588,6 +629,7 @@ function isRequestError(
       return category === "scope" || category === "store";
     case "hello":
     case "daemon.status":
+    case "daemon.reload":
     case "daemon.stop":
     case "daemon.logs":
       return false;

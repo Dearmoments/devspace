@@ -39,6 +39,7 @@ import {
   type OnboardingDestination,
   SUBAGENT_SKILL_INSTALL_COMMAND,
   resolveOnboardingUsage,
+  disableOnboardingSubagents,
   updateOnboardingSubagentsConfig,
   usesChatGpt,
   usesCodingAgents,
@@ -195,33 +196,37 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
     }
 
     const currentSubagents = resolveSubagentsConfig(files.config.subagents, {});
-    const availability = getLocalAgentProviderAvailabilitySnapshot();
-    const configuredProviders = currentSubagents.providers
-      .filter((provider) => provider.enabled)
-      .map((provider) => provider.id);
-    const initialValues = configuredProviders.length > 0
-      ? configuredProviders
-      : availability
-          .filter((provider) => provider.available)
-          .map((provider) => provider.name);
-    const providerAnswer = await prompts.multiselect({
-      message: "Which Coding Agents should be available?",
-      options: availability.map((provider) => ({
-        value: provider.name,
-        label: provider.name,
-        hint: provider.available
-          ? provider.note ?? "available"
-          : `unavailable: ${provider.reason ?? "provider preflight failed"}`,
-      })),
-      initialValues,
-      required: true,
-    });
-    if (prompts.isCancel(providerAnswer)) throw new SetupCancelledError();
-    const selectedProviders = providerAnswer as LocalAgentProvider[];
-    const subagents = updateOnboardingSubagentsConfig(
-      currentSubagents,
-      selectedProviders,
-    );
+    let selectedProviders: LocalAgentProvider[] = [];
+    let subagents = disableOnboardingSubagents();
+    if (useCodingAgents) {
+      const availability = getLocalAgentProviderAvailabilitySnapshot();
+      const configuredProviders = currentSubagents.providers
+        .filter((provider) => provider.enabled)
+        .map((provider) => provider.id);
+      const initialValues = configuredProviders.length > 0
+        ? configuredProviders
+        : availability
+            .filter((provider) => provider.available)
+            .map((provider) => provider.name);
+      const providerAnswer = await prompts.multiselect({
+        message: "Which Coding Agents should be available?",
+        options: availability.map((provider) => ({
+          value: provider.name,
+          label: provider.name,
+          hint: provider.available
+            ? provider.note ?? "available"
+            : `unavailable: ${provider.reason ?? "provider preflight failed"}`,
+        })),
+        initialValues,
+        required: true,
+      });
+      if (prompts.isCancel(providerAnswer)) throw new SetupCancelledError();
+      selectedProviders = providerAnswer as LocalAgentProvider[];
+      subagents = updateOnboardingSubagentsConfig(
+        currentSubagents,
+        selectedProviders,
+      );
+    }
 
     const config: DevspaceUserConfig = {
       ...files.config,
@@ -240,7 +245,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
 
     const lines = [
       ...(allowedRoots ? [`Project folders: ${allowedRoots.join(", ")}`] : []),
-      `Coding Agents: ${selectedProviders.join(", ")}`,
+      ...(useCodingAgents ? [`Coding Agents: ${selectedProviders.join(", ")}`] : []),
       ...(publicBaseUrl ? [`ChatGPT connection URL: ${publicBaseUrl}/mcp`] : []),
     ];
     prompts.note(lines.join("\n"), "DevSpace is ready");

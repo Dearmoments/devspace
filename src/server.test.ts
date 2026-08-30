@@ -35,7 +35,7 @@ test("list_projects discovers allowed roots before a workspace is opened", async
   assert.ok(listTool);
   assert.equal(
     (listTool._meta as { ui?: { resourceUri?: string } } | undefined)?.ui?.resourceUri,
-    "ui://devspace/workspace-app.html",
+    undefined,
   );
 
   const result = await context.client.callTool({ name: "list_projects", arguments: {} });
@@ -47,7 +47,7 @@ test("list_projects discovers allowed roots before a workspace is opened", async
     ),
   );
   assert.match(responseText(result), /Immediate project directories:/);
-  assert.equal(responseCard(result).tool, "list_projects");
+  assert.equal((result._meta as Record<string, unknown> | undefined)?.card, undefined);
 });
 
 test("admin-disabled core tools are omitted from tools/list", async (t) => {

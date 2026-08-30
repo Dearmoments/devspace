@@ -53,6 +53,7 @@ export interface LocalAgentDaemonManager {
   continue(agentId: string, prompt: string, overrides: RunOverrides | undefined, scope: LocalAgentWorkspaceScope): Promise<Result<LocalAgentRecord, AgentContinueError>>;
   get(agentId: string, scope: LocalAgentWorkspaceScope): Result<LocalAgentRecord, AgentLookupError>;
   list(scope: LocalAgentWorkspaceScope): Result<LocalAgentRecord[], AgentListError>;
+  reloadSubagents?(config: import("./local-agent-config.js").SubagentsConfig): void;
   evictIdle(now?: number): Promise<void>;
   close(): Promise<void>;
   readonly activeTurnCount: number;
@@ -308,6 +309,17 @@ export class LocalAgentDaemon {
       case "agent.list":
         return unwrapManagerResult(this.manager.list(request.params));
       case "daemon.status":
+        return this.status();
+      case "daemon.reload":
+        if (!this.manager.reloadSubagents) {
+          throw new AgentDaemonUnavailableError({
+            code: "DAEMON_UNAVAILABLE",
+            operation: "daemon.reload",
+            retryable: true,
+            message: "This local agent daemon cannot reload configuration; restart it first.",
+          });
+        }
+        this.manager.reloadSubagents(request.params.subagents);
         return this.status();
       case "daemon.stop":
         this.stopping = true;
