@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import express from "express";
 import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { databasePath, openDatabase } from "./db/client.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
@@ -24,6 +25,7 @@ try {
   testPersistenceAndTokenHashing(join(root, "persistence"));
   testExpiredTokenCleanup(join(root, "expiration"));
   testTransactionalTokenRotation(join(root, "rotation"));
+  await testOwnerAuthorization(join(root, "owner-authorization"));
   await testProviderRestartRotationAndRevocation(join(root, "provider"));
 } finally {
   await rm(root, { recursive: true, force: true });
@@ -183,6 +185,61 @@ function testTransactionalTokenRotation(stateDir: string): void {
     assert.equal(store.getRefreshToken("losing-refresh-hash"), undefined);
   } finally {
     store.close();
+  }
+}
+
+async function testOwnerAuthorization(stateDir: string): Promise<void> {
+  const provider = new SingleUserOAuthProvider(oauthConfig, mcpUrl, stateDir);
+  const client = await provider.clientsStore.registerClient?.({
+    redirect_uris: [redirectUri],
+    client_name: "Owner authorization regression test",
+  });
+  assert.ok(client);
+  const app = express();
+  app.use(express.urlencoded({ extended: false }));
+  app.all("/authorize", async (_req, res) => {
+    await provider.authorize(client, {
+      redirectUri,
+      codeChallenge: "test-pkce-challenge",
+      scopes: ["devspace"],
+      resource: mcpUrl,
+    }, res);
+  });
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const url = `http://127.0.0.1:${address.port}/authorize`;
+  try {
+    const page = await fetch(url);
+    assert.equal(page.status, 200);
+    assert.match(await page.text(), /name="owner_token"/);
+    const deniedCases: Record<string, string>[] = [{}, { owner_token: "" }, { owner_token: "wrong-owner-password" }];
+    for (const fields of deniedCases) {
+      const denied = await fetch(url, {
+        method: "POST",
+        redirect: "manual",
+        body: new URLSearchParams(fields),
+      });
+      assert.equal(denied.status, 401);
+      assert.equal(denied.headers.get("location"), null);
+      assert.match(await denied.text(), /Owner password was not accepted/);
+    }
+    const approved = await fetch(url, {
+      method: "POST",
+      redirect: "manual",
+      body: new URLSearchParams({ owner_token: oauthConfig.ownerToken }),
+    });
+    assert.equal(approved.status, 302);
+    const code = new URL(approved.headers.get("location")!).searchParams.get("code");
+    assert.ok(code);
+    const issued = await provider.exchangeAuthorizationCode(client, code, undefined, redirectUri, mcpUrl);
+    assert.ok(issued.access_token);
+    assert.ok(issued.refresh_token);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    provider.close();
   }
 }
 
